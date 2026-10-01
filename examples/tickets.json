@@ -1,0 +1,12 @@
+[
+  {
+    "ticket_id": "T-001",
+    "customer": "示例客户甲",
+    "subject": "无法下载订单"
+  },
+  {
+    "ticket_id": "T-002",
+    "customer": "示例客户乙",
+    "subject": "修改收货地址"
+  }
+]
