@@ -101,3 +101,33 @@ class SupportDesk(JsonStore):
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")
         return sorted((t for t in self._read().get("tickets", {}).values() if status is None or t["status"] == status), key=lambda t: t["ticket_id"])
+
+    def publish_knowledge(self, article_id, ticket_id):
+        article_id, ticket_id = text(article_id, "article_id"), text(ticket_id, "ticket_id")
+        data = self._read()
+        knowledge = data.setdefault("knowledge", {})
+        if article_id in knowledge:
+            raise ValueError("article already exists")
+        if any(article["source_ticket_id"] == ticket_id for article in knowledge.values()):
+            raise ValueError("ticket already published")
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] != "closed":
+            raise ValueError("ticket must exist and be closed")
+        article = {"article_id": article_id, "source_ticket_id": ticket_id, "title": ticket["subject"], "content": ticket["resolution"]}
+        knowledge[article_id] = article
+        self._write(data)
+        return article
+
+    def search_knowledge(self, query=None):
+        if query is not None:
+            if not isinstance(query, str):
+                raise ValueError("query must be a string or null")
+            words = [word.casefold() for word in query.split()]
+            if not words:
+                raise ValueError("query must be a nonempty string")
+        else:
+            words = None
+        articles = list(self._read().get("knowledge", {}).values())
+        if words is not None:
+            articles = [article for article in articles if all(word in article["title"].casefold() or word in article["content"].casefold() for word in words)]
+        return sorted(articles, key=lambda article: article["article_id"])

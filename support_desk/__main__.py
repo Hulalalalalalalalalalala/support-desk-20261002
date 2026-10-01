@@ -5,7 +5,7 @@ import sys
 import tempfile
 from . import SupportDesk
 
-ACTIONS = {'open': 'open_ticket', 'get': 'get', 'assign': 'assign', 'note': 'note', 'close': 'close', 'list': 'list_tickets', 'respond': 'respond', 'response-stats': 'response_stats', 'response-queue': 'response_queue'}
+ACTIONS = {'open': 'open_ticket', 'get': 'get', 'assign': 'assign', 'note': 'note', 'close': 'close', 'list': 'list_tickets', 'respond': 'respond', 'response-stats': 'response_stats', 'response-queue': 'response_queue', 'knowledge-publish': 'publish_knowledge', 'knowledge-search': 'search_knowledge'}
 
 def samples(name):
     return json.loads((Path(__file__).resolve().parent.parent / "examples" / name).read_text(encoding="utf-8"))
