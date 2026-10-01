@@ -1,4 +1,4 @@
-from .storage import JsonStore, text, minute
+from .storage import JsonStore, text, minute, positive
 
 class SupportDesk(JsonStore):
     def open_ticket(self, ticket_id, customer, subject, opened_at=None):
@@ -78,6 +78,24 @@ class SupportDesk(JsonStore):
             "average_minutes": sum(durations) / len(durations) if durations else None,
             "max_minutes": max(durations) if durations else None,
         }
+
+    def response_queue(self, as_of, target_minutes=30):
+        as_of = minute(as_of, "as_of")
+        target_minutes = positive(target_minutes, "target_minutes")
+        items = []
+        untimed = 0
+        for ticket in self._read().get("tickets", {}).values():
+            if ticket["status"] == "closed" or ticket.get("first_response") is not None:
+                continue
+            if "opened_at" not in ticket:
+                untimed += 1
+                continue
+            if ticket["opened_at"] > as_of:
+                raise ValueError("opened_at must not be later than as_of")
+            waiting = as_of - ticket["opened_at"]
+            items.append({"ticket": ticket, "waiting_minutes": waiting, "overdue": waiting > target_minutes})
+        items.sort(key=lambda item: (item["ticket"]["opened_at"], item["ticket"]["ticket_id"]))
+        return {"untimed": untimed, "items": items}
 
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):
