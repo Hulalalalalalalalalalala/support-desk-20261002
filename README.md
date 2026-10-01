@@ -31,6 +31,7 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `list` → `SupportDesk.list_tickets(...)`。参数名见 `core.py` 的公开方法签名。
 - `respond` → `SupportDesk.respond(...)`：登记首次响应，参数为 `ticket_id`、`message`、`responded_at`（非负整数分钟，不得早于 `opened_at`，相等允许），返回完整工单；不改变状态、指派、备注或解决说明。
 - `response-stats` → `SupportDesk.response_stats()`：汇总首次响应耗时（`timed`、`responded`、`pending`、`untimed` 计数及 `average_minutes`、`max_minutes`），无参数，可省略输入文件，不写数据。
+- `response-queue` → `SupportDesk.response_queue(as_of, target_minutes=30)`：返回首响待办队列 `{"untimed": ..., "items": [...]}`。`as_of` 为非负整数分钟、`target_minutes` 为正整数分钟，非法类型或越界整数均抛 `ValueError`。仅反映当前保存状态：已关闭或已有首次响应的工单不入队；未关闭未响应且有 `opened_at` 的工单按 `opened_at` 升序（同分钟按 `ticket_id` 字符串升序）进入 `items`，每项含完整工单 `ticket`、`waiting_minutes`（`as_of - opened_at`）与布尔值 `overdue`（等待分钟严格大于目标才算超时）；缺少 `opened_at` 的计入 `untimed`。任一入队工单的 `opened_at` 晚于 `as_of` 时整个查询抛错。查询不写数据，空目录也不创建 `data.json`。
 
 命令成功向标准输出打印 JSON 并返回 0；输入或本地文件错误向标准错误输出说明并返回 2。无参数的方法可省略输入文件。数据保存在 `root/data.json`，每次成功修改后保存；适用于单进程本地使用。
 
