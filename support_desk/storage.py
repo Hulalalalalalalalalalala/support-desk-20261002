@@ -37,3 +37,9 @@ def positive(value, label):
     if type(value) is not int or value <= 0:
         raise ValueError(label + " must be a positive integer")
     return value
+
+def minute(value, label):
+    # bool is a subclass of int, so compare types explicitly; floats are rejected too.
+    if type(value) is not int or value < 0:
+        raise ValueError(label + " must be a nonnegative integer minute")
+    return value
