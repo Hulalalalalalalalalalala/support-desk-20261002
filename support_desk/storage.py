@@ -37,3 +37,14 @@ def positive(value, label):
     if type(value) is not int or value <= 0:
         raise ValueError(label + " must be a positive integer")
     return value
+
+def minute(value, label):
+    # Simulated local clock time: a nonnegative integer number of minutes.
+    if type(value) is not int or value < 0:
+        raise ValueError(label + " must be a nonnegative integer minute")
+    return value
+
+def optional_minute(value, label):
+    if value is None:
+        return None
+    return minute(value, label)

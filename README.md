@@ -23,12 +23,14 @@ python3 -m support_desk --root ./state open examples/tickets.json
 
 JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后续失败不会回滚整批。重跑登记命令遇到已存在的标识会报错。
 
-- `open` → `SupportDesk.open_ticket(...)`。参数名见 `core.py` 的公开方法签名。
+- `open` → `SupportDesk.open_ticket(...)`。参数名见 `core.py` 的公开方法签名；可选 `opened_at` 为非负整数分钟，提供时同时写入初值为 `null` 的 `first_response`。
 - `get` → `SupportDesk.get(...)`。参数名见 `core.py` 的公开方法签名。
 - `assign` → `SupportDesk.assign(...)`。参数名见 `core.py` 的公开方法签名。
 - `note` → `SupportDesk.note(...)`。参数名见 `core.py` 的公开方法签名。
 - `close` → `SupportDesk.close(...)`。参数名见 `core.py` 的公开方法签名。
 - `list` → `SupportDesk.list_tickets(...)`。参数名见 `core.py` 的公开方法签名。
+- `respond` → `SupportDesk.respond(...)`：登记首次响应，需要工单已通过 `opened_at` 登记时间。
+- `response-stats` → `SupportDesk.response_stats()`：无参数统计，可省略输入文件，不写数据。
 
 命令成功向标准输出打印 JSON 并返回 0；输入或本地文件错误向标准错误输出说明并返回 2。无参数的方法可省略输入文件。数据保存在 `root/data.json`，每次成功修改后保存；适用于单进程本地使用。
 
@@ -38,4 +40,4 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 
 ## 当前边界
 
-当前没有响应时效统计、知识库、外部消息集成或权限系统；时间由使用者提供。 不承诺并发写入或断电恢复。
+当前没有知识库、外部消息集成或权限系统；时间由使用者以本地模拟时钟的非负整数分钟提供。 不承诺并发写入或断电恢复。
