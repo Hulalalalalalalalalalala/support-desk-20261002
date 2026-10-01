@@ -32,6 +32,8 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `respond` → `SupportDesk.respond(...)`：登记首次响应，参数为 `ticket_id`、`message`、`responded_at`（非负整数分钟，不得早于 `opened_at`，相等允许），返回完整工单；不改变状态、指派、备注或解决说明。
 - `response-stats` → `SupportDesk.response_stats()`：汇总首次响应耗时（`timed`、`responded`、`pending`、`untimed` 计数及 `average_minutes`、`max_minutes`），无参数，可省略输入文件，不写数据。
 - `response-queue` → `SupportDesk.response_queue(as_of, target_minutes=30)`：查看模拟时刻 `as_of`（非负整数分钟）仍待首次响应的工单队列，`target_minutes` 为正整数分钟。返回 `{"untimed": n, "items": [...]}`：未关闭且无首次响应且有 `opened_at` 的工单进入 `items`，每项含完整工单 `ticket`、`waiting_minutes`（`as_of - opened_at`）与 `overdue`（等待严格大于目标才为真），按 `opened_at` 升序、同分钟按 `ticket_id` 升序；缺少 `opened_at` 的待响应工单只计入 `untimed`。任一入队工单的 `opened_at` 晚于 `as_of` 则整个查询报错。只读，不写数据。
+- `knowledge-publish` → `SupportDesk.publish_knowledge(article_id, ticket_id)`：从已关闭工单发布知识条目，条目含 `article_id`、`source_ticket_id`、`title`（工单 subject）、`content`（工单 resolution）四个字段并返回完整条目。两个标识去除首尾空白、区分大小写；同一 root 内 `article_id` 唯一，每个工单只可发布一次。参数非字符串或去空白后为空、标识重复、工单已发布过、工单不存在或未关闭均报错且不写数据；来源工单保持原样，无 `opened_at` 或首次响应记录的已关闭工单也可发布。
+- `knowledge-search` → `SupportDesk.search_knowledge(query=None)`：检索知识条目。`query` 省略或为 `null` 时返回全部；否则须为非空白字符串，去除首尾空白后按空白拆词，以 Unicode casefold 语义忽略大小写，每个词均需作为连续子串出现在 `title` 或 `content` 中（可分别命中不同字段），标点按字面匹配。返回完整条目数组，按 `article_id` 升序，无匹配返回 `[]`。只读，不写数据；无知识条目或空目录返回 `[]`。
 
 命令成功向标准输出打印 JSON 并返回 0；输入或本地文件错误向标准错误输出说明并返回 2。无参数的方法可省略输入文件。数据保存在 `root/data.json`，每次成功修改后保存；适用于单进程本地使用。
 
@@ -41,4 +43,4 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 
 ## 当前边界
 
-当前没有知识库、外部消息集成或权限系统；时间由使用者提供（本地模拟时钟的非负整数分钟）。 不承诺并发写入或断电恢复。
+当前没有外部消息集成或权限系统；时间由使用者提供（本地模拟时钟的非负整数分钟）。 不承诺并发写入或断电恢复。

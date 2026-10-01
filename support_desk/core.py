@@ -97,6 +97,35 @@ class SupportDesk(JsonStore):
         items.sort(key=lambda item: (item["ticket"]["opened_at"], item["ticket"]["ticket_id"]))
         return {"untimed": untimed, "items": items}
 
+    def publish_knowledge(self, article_id, ticket_id):
+        article_id, ticket_id = text(article_id, "article_id"), text(ticket_id, "ticket_id")
+        data = self._read()
+        knowledge = data.get("knowledge", {})
+        if article_id in knowledge:
+            raise ValueError("article already exists")
+        if any(entry["source_ticket_id"] == ticket_id for entry in knowledge.values()):
+            raise ValueError("ticket already published")
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] != "closed":
+            raise ValueError("source ticket must exist and be closed")
+        entry = {"article_id": article_id, "source_ticket_id": ticket_id, "title": ticket["subject"], "content": ticket["resolution"]}
+        data.setdefault("knowledge", {})[article_id] = entry
+        self._write(data)
+        return entry
+
+    def search_knowledge(self, query=None):
+        if query is None:
+            terms = None
+        elif not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a nonempty string")
+        else:
+            terms = [term.casefold() for term in query.strip().split()]
+        entries = sorted(self._read().get("knowledge", {}).values(), key=lambda entry: entry["article_id"])
+        if terms is None:
+            return entries
+        return [entry for entry in entries
+                if all(term in entry["title"].casefold() or term in entry["content"].casefold() for term in terms)]
+
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")
