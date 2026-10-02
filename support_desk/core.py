@@ -64,6 +64,43 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
+    def auto_assign(self, assignees, max_open=5):
+        if not isinstance(assignees, (list, tuple)) or not assignees:
+            raise ValueError("assignees must be a nonempty array")
+        names = [text(name, "assignees") for name in assignees]
+        if len(set(names)) != len(names):
+            raise ValueError("assignees must not contain duplicates")
+        max_open = positive(max_open, "max_open")
+        data = self._read()
+        tickets = data.get("tickets", {})
+        # Load counts every open ticket whose assignee exactly matches a candidate,
+        # including already-answered and untimed ones; closed tickets never count.
+        loads = {name: 0 for name in names}
+        for ticket in tickets.values():
+            if ticket["status"] == "open" and ticket.get("assignee") in loads:
+                loads[ticket["assignee"]] += 1
+        candidates = [ticket for ticket in tickets.values()
+                      if ticket["status"] == "open" and ticket.get("assignee") is None]
+        candidates.sort(key=lambda t: (PRIORITY_RANK[t.get("priority", "normal")],
+                                       "opened_at" not in t,
+                                       t.get("opened_at", 0),
+                                       t["ticket_id"]))
+        assigned = []
+        remaining = []
+        for ticket in candidates:
+            available = [name for name in names if loads[name] < max_open]
+            if not available:
+                # Loads only grow, so once everyone is full the rest all remain.
+                remaining.extend(t["ticket_id"] for t in candidates[len(assigned) + len(remaining):])
+                break
+            chosen = min(available, key=lambda name: (loads[name], name))
+            ticket["assignee"] = chosen
+            loads[chosen] += 1
+            assigned.append(ticket)
+        if assigned:
+            self._write(data)
+        return {"assigned": assigned, "remaining": remaining}
+
     def priority_queue(self):
         items = [{"ticket": ticket, "priority": ticket.get("priority", "normal")}
                  for ticket in self._read().get("tickets", {}).values()
