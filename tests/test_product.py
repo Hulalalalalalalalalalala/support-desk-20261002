@@ -261,6 +261,110 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([e["article_id"] for e in json.loads(result.stdout)], ["KB-2"])
 
+    def _published_article(self, article_id="KB-1", ticket_id="T", subject="Download", resolution="Sent link"):
+        self._closed_ticket(ticket_id, subject=subject, resolution=resolution)
+        return self.app.publish_knowledge(article_id, ticket_id)
+
+    def test_update_knowledge_replaces_title_and_content_and_persists(self):
+        self._published_article()
+        entry = self.app.update_knowledge(" KB-1 ", "  新的 下载指引 ", "  \n新办法： 第一步, 第二步。\n  附：标点保留！ \n")
+        self.assertEqual(entry, {"article_id": "KB-1", "source_ticket_id": "T",
+                                 "title": "新的 下载指引",
+                                 "content": "新办法： 第一步, 第二步。\n  附：标点保留！"})
+        self.assertEqual(set(entry), {"article_id", "source_ticket_id", "title", "content"})
+        reloaded = SupportDesk(self.root)
+        self.assertEqual(reloaded.search_knowledge(), [entry])
+        again = reloaded.update_knowledge("KB-1", "新的 下载指引", "新办法： 第一步, 第二步。\n  附：标点保留！")
+        self.assertEqual(again, entry)
+        self.assertEqual(SupportDesk(self.root).search_knowledge(), [entry])
+
+    def test_update_knowledge_changes_search_and_later_snapshots_only(self):
+        self._published_article()
+        self.app.open_ticket("T-a", "Alice", "Need download", opened_at=1)
+        self.app.respond_with_knowledge("T-a", "KB-1", 2)
+        self.app.update_knowledge("KB-1", "下载指引", "新办法")
+        self.assertEqual([e["article_id"] for e in self.app.search_knowledge("旧办法")], [])
+        self.assertEqual([e["article_id"] for e in self.app.search_knowledge("sent")], [])
+        self.assertEqual([e["article_id"] for e in self.app.search_knowledge("新办法")], ["KB-1"])
+        ticket_a = self.app.get("T-a")
+        self.assertEqual(ticket_a["first_response"]["message"], "Sent link")
+        self.assertEqual(ticket_a["first_response"]["responded_at"], 2)
+        self.assertEqual(ticket_a["first_response"]["knowledge"]["content"], "Sent link")
+        self.app.open_ticket("T-b", "Bob", "Need new", opened_at=3)
+        self.app.respond_with_knowledge("T-b", "KB-1", 4)
+        ticket_b = self.app.get("T-b")
+        self.assertEqual(ticket_b["first_response"]["message"], "新办法")
+        self.assertEqual(ticket_b["first_response"]["knowledge"]["content"], "新办法")
+        self.app.update_knowledge("KB-1", "下载指引", "第三个版本")
+        self.assertEqual(self.app.get("T-a")["first_response"]["knowledge"]["content"], "Sent link")
+        self.assertEqual(self.app.get("T-b")["first_response"]["knowledge"]["content"], "新办法")
+        source = self.app.get("T")
+        self.assertEqual((source["subject"], source["resolution"]), ("Download", "Sent link"))
+
+    def test_update_knowledge_works_on_historical_four_field_entries(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.app.path.write_text(json.dumps({"knowledge": {"KB-9": {
+            "article_id": "KB-9", "source_ticket_id": "T-9", "title": "Old", "content": "Past"}}}),
+            encoding="utf-8")
+        entry = SupportDesk(self.root).update_knowledge("KB-9", "New", "Current")
+        self.assertEqual(entry, {"article_id": "KB-9", "source_ticket_id": "T-9",
+                                 "title": "New", "content": "Current"})
+
+    def test_update_knowledge_rejects_bad_input_without_writing(self):
+        self._published_article()
+        before = self.app.path.read_bytes()
+        for article_id, title, content in [
+            (None, "Title", "Body"), (1, "Title", "Body"), (" ", "Title", "Body"),
+            ("KB-1", None, "Body"), ("KB-1", 1, "Body"), ("KB-1", " ", "Body"),
+            ("KB-1", "Title", None), ("KB-1", "Title", 1), ("KB-1", "Title", "\t "),
+            ("kb-1", "Title", "Body"), ("KB-X", "Title", "Body"),
+        ]:
+            with self.assertRaises(ValueError, msg=(article_id, title, content)):
+                self.app.update_knowledge(article_id, title, content)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.search_knowledge()[0]["content"], "Sent link")
+        app = SupportDesk(self.root)
+        with self.assertRaises(TypeError):
+            app.update_knowledge("KB-1", "Title")
+        with self.assertRaises(TypeError):
+            app.update_knowledge("KB-1", "Title", "Body", extra="x")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_update_knowledge_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.update_knowledge("KB-1", "Title", "Body")
+        self.assertFalse(fresh.exists())
+
+    def test_cli_update_knowledge(self):
+        self._published_article()
+        payload = self.root / "update.json"
+        payload.write_text(json.dumps({"article_id": "KB-1", "title": "新标题", "content": "新正文"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-update", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         {"article_id": "KB-1", "source_ticket_id": "T", "title": "新标题", "content": "新正文"})
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"article_id": "KB-1", "title": "第二个版本", "content": "正文二"},
+            {"article_id": "KB-X", "title": "缺失", "content": "正文"},
+            {"article_id": "KB-1", "title": "不应到达", "content": "正文三"},
+        ]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-update", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(SupportDesk(self.root).search_knowledge()[0]["content"], "正文二")
+        missing_args = self.root / "missing-args.json"
+        missing_args.write_text(json.dumps({"article_id": "KB-1", "title": "x"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-update", str(missing_args)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        fresh = self.root / "empty-dir"
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(fresh), "knowledge-update", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(fresh.exists())
+
     def _knowledge_response_setup(self):
         self._closed_ticket("T-src", subject="Download", resolution="Sent link")
         entry = self.app.publish_knowledge("KB-1", "T-src")
