@@ -354,6 +354,48 @@ class SupportDesk(JsonStore):
         self._write(data)
         return {"article": entry, "enabled": enabled}
 
+    def knowledge_usage_report(self, since=0, until=None):
+        since = minute(since, "since")
+        if until is not None:
+            until = minute(until, "until")
+            if until < since:
+                raise ValueError("until must not be earlier than since")
+        data = self._read()
+        usage = {}
+        def record(article_id, ticket_id, moment, field):
+            stats = usage.setdefault(article_id, {"first_responses": 0, "replies": 0, "tickets": set(), "last_used_at": None})
+            stats[field] += 1
+            stats["tickets"].add(ticket_id)
+            if stats["last_used_at"] is None or moment > stats["last_used_at"]:
+                stats["last_used_at"] = moment
+        for ticket in data.get("tickets", {}).values():
+            response = ticket.get("first_response")
+            if response is not None:
+                knowledge = response.get("knowledge")
+                if knowledge is not None and knowledge.get("article_id") is not None:
+                    moment = response["responded_at"]
+                    if since <= moment and (until is None or moment < until):
+                        record(knowledge["article_id"], ticket["ticket_id"], moment, "first_responses")
+            for reply in ticket.get("replies") or []:
+                knowledge = reply.get("knowledge")
+                if knowledge is not None and knowledge.get("article_id") is not None:
+                    moment = reply["replied_at"]
+                    if since <= moment and (until is None or moment < until):
+                        record(knowledge["article_id"], ticket["ticket_id"], moment, "replies")
+        states = data.get("knowledge_enabled", {})
+        report = []
+        for article_id in sorted(data.get("knowledge", {})):
+            stats = usage.get(article_id)
+            report.append({
+                "article": data["knowledge"][article_id],
+                "enabled": states.get(article_id, True),
+                "first_responses": stats["first_responses"] if stats else 0,
+                "replies": stats["replies"] if stats else 0,
+                "ticket_count": len(stats["tickets"]) if stats else 0,
+                "last_used_at": stats["last_used_at"] if stats else None,
+            })
+        return report
+
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")
