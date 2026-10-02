@@ -781,5 +781,135 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.stdout, "")
         self.assertEqual([e["article_id"] for e in SupportDesk(self.root).search_knowledge()], ["KB-1"])
 
+    def test_reopen_persists_history_and_preserves_fields(self):
+        self.app.open_ticket("T", "Alice", "Download", opened_at=5)
+        self.app.assign("T", "Bob")
+        self.app.note("T", "Checked")
+        self.app.set_category("T", "network")
+        self.app.set_priority("T", "high")
+        self.app.respond("T", "On it", 6)
+        self.app.close("T", "Sent link\nv1")
+        self.assertNotIn("reopen_history", self.app.get("T"))
+        ticket = self.app.reopen_ticket(" T ", "  Still broken\n真的！ ")
+        self.assertEqual((ticket["status"], ticket["resolution"]), ("open", None))
+        self.assertEqual(ticket["reopen_history"],
+                         [{"reason": "Still broken\n真的！", "resolution": "Sent link\nv1"}])
+        self.assertEqual((ticket["customer"], ticket["subject"], ticket["assignee"],
+                          ticket["notes"], ticket["category"], ticket["priority"],
+                          ticket["opened_at"]),
+                         ("Alice", "Download", "Bob", ["Checked"], "network", "high", 5))
+        self.assertEqual(ticket["first_response"], {"message": "On it", "responded_at": 6})
+        # the reason is never appended to notes
+        self.assertEqual(ticket["notes"], ["Checked"])
+        # history and state survive recreating SupportDesk
+        reloaded = SupportDesk(self.root).get("T")
+        self.assertEqual(reloaded, ticket)
+        # an existing first response cannot be registered again after reopening
+        with self.assertRaises(ValueError):
+            self.app.respond("T", "again", 9)
+
+    def test_reopen_history_appends_in_order_across_close_cycles(self):
+        self._closed_ticket("T", resolution="First fix")
+        self.app.reopen_ticket("T", "back once")
+        self.app.close("T", "Second fix")
+        ticket = self.app.reopen_ticket("T", "back twice")
+        self.assertEqual([(h["reason"], h["resolution"]) for h in ticket["reopen_history"]],
+                         [("back once", "First fix"), ("back twice", "Second fix")])
+        # the reopened ticket is back in the pending queue, timed from opened_at-less ticket
+        self.assertEqual([t["ticket_id"] for t in self.app.list_tickets("open")], ["T"])
+
+    def test_reopen_unanswered_timed_ticket_re_enters_queues_and_stats(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=10)
+        self.app.assign("T", "Bob")
+        self.app.close("T", "Done")
+        self.app.reopen_ticket("T", "regression")
+        queue = self.app.response_queue(40)
+        self.assertEqual([(i["ticket"]["ticket_id"], i["waiting_minutes"]) for i in queue["items"]],
+                         [("T", 30)])
+        self.assertEqual([i["ticket"]["ticket_id"] for i in self.app.priority_queue()], ["T"])
+        stats = self.app.response_stats()
+        self.assertEqual((stats["timed"], stats["responded"], stats["pending"]), (1, 0, 1))
+
+    def test_reopen_untimed_ticket_gets_no_clock_fields(self):
+        self.app.open_ticket("T", "Alice", "No clock")
+        self.app.assign("T", "Bob")
+        self.app.close("T", "Fixed")
+        ticket = self.app.reopen_ticket("T", "back")
+        self.assertNotIn("opened_at", ticket)
+        self.assertNotIn("first_response", ticket)
+        self.assertEqual(self.app.response_queue(40)["untimed"], 1)
+
+    def test_reopen_keeps_knowledge_occupancy_and_snapshots(self):
+        self._closed_ticket("T-src", subject="S", resolution="Answer")
+        entry = self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T", "Cara", "Q", opened_at=5)
+        self.app.respond_with_knowledge("T", "KB-1", 6)
+        self.app.assign("T", "Dan")
+        self.app.close("T", "Closed")
+        snapshot = self.app.get("T")["first_response"]
+        self.app.reopen_ticket("T", "again")
+        # published entry and the saved answer snapshot are untouched
+        self.assertEqual(self.app.search_knowledge(), [entry])
+        self.assertEqual(self.app.get("T")["first_response"], snapshot)
+        # reopening the source does not release article or source-ticket occupancy
+        self.app.reopen_ticket("T-src", "more")
+        with self.assertRaises(ValueError):
+            self.app.publish_knowledge("KB-1", "T-other")
+        with self.assertRaises(ValueError):
+            self.app.publish_knowledge("KB-2", "T-src")
+        # an unpublished reopened ticket can only be published after closing again
+        with self.assertRaises(ValueError):
+            self.app.publish_knowledge("KB-3", "T")
+        self.app.close("T", "Final")
+        self.assertEqual(self.app.publish_knowledge("KB-3", "T")["content"], "Final")
+
+    def test_reopen_rejects_bad_input_without_writing(self):
+        self.app.open_ticket("T-open", "Alice", "Open")
+        self._closed_ticket("T-closed")
+        before = self.app.path.read_bytes()
+        for ticket_id, reason in [(None, "r"), (1, "r"), (" ", "r"), ("T-closed", None),
+                                  ("T-closed", 1), ("T-closed", " "), ("missing", "r"),
+                                  ("T-open", "r"), ("t-closed", "r")]:
+            with self.assertRaises(ValueError, msg=(ticket_id, reason)):
+                self.app.reopen_ticket(ticket_id, reason)
+        with self.assertRaises(TypeError):
+            self.app.reopen_ticket("T-closed")
+        with self.assertRaises(TypeError):
+            self.app.reopen_ticket("T-closed", "r", "extra")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertNotIn("reopen_history", self.app.get("T-closed"))
+
+    def test_reopen_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.reopen_ticket("T", "reason")
+        self.assertFalse(fresh.exists())
+
+    def test_cli_reopen_success_and_batch_stop_on_error(self):
+        self._closed_ticket("T-1")
+        self._closed_ticket("T-2")
+        payload = self.root / "reopen.json"
+        payload.write_text(json.dumps({"ticket_id": " T-1 ", "reason": "  back\n仍然坏了。 "}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "reopen", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual((value["status"], value["resolution"]), ("open", None))
+        self.assertEqual(value["reopen_history"],
+                         [{"reason": "back\n仍然坏了。", "resolution": "Sent link"}])
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"ticket_id": "T-2", "reason": "regression"},
+            {"ticket_id": "missing", "reason": "x"},
+            {"ticket_id": "T-1", "reason": "should not run"},
+        ]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "reopen", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(failed.stdout, "")
+        reloaded = SupportDesk(self.root)
+        self.assertEqual(len(reloaded.get("T-2")["reopen_history"]), 1)
+        self.assertEqual(len(reloaded.get("T-1")["reopen_history"]), 1)
+
 if __name__ == "__main__":
     unittest.main()

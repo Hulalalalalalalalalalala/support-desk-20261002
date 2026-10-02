@@ -51,6 +51,18 @@ class SupportDesk(JsonStore):
             ticket.update(status="closed", resolution=resolution)
         return self._change(ticket_id, apply)
 
+    def reopen_ticket(self, ticket_id, reason):
+        ticket_id, reason = text(ticket_id, "ticket_id"), text(reason, "reason")
+        data = self._read()
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] != "closed":
+            raise ValueError("ticket must exist and be closed")
+        ticket.setdefault("reopen_history", []).append(
+            {"reason": reason, "resolution": ticket["resolution"]})
+        ticket.update(status="open", resolution=None)
+        self._write(data)
+        return ticket
+
     def priority_queue(self):
         items = [{"ticket": ticket, "priority": ticket.get("priority", "normal")}
                  for ticket in self._read().get("tickets", {}).values()
