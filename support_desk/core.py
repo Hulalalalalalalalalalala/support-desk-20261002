@@ -206,6 +206,19 @@ class SupportDesk(JsonStore):
         self._write(data)
         return entry
 
+    def update_knowledge(self, article_id, title, content):
+        article_id, title, content = (text(article_id, "article_id"),
+                                      text(title, "title"),
+                                      text(content, "content"))
+        data = self._read()
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        entry["title"] = title
+        entry["content"] = content
+        self._write(data)
+        return entry
+
     def search_knowledge(self, query=None):
         if query is None:
             terms = None
