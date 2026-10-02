@@ -41,6 +41,29 @@ class SupportDesk(JsonStore):
         assignee = text(assignee, "assignee")
         return self._change(ticket_id, lambda t: t.update(assignee=assignee))
 
+    def transfer_ticket(self, ticket_id, assignee, reason, transferred_at):
+        ticket_id, assignee, reason = (text(ticket_id, "ticket_id"),
+                                       text(assignee, "assignee"),
+                                       text(reason, "reason"))
+        transferred_at = minute(transferred_at, "transferred_at")
+        data = self._read()
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] != "open" or not ticket.get("assignee"):
+            raise ValueError("ticket must exist, be open and assigned")
+        if assignee == ticket["assignee"]:
+            raise ValueError("assignee must differ from the current assignee")
+        if "opened_at" in ticket and transferred_at < ticket["opened_at"]:
+            raise ValueError("transferred_at must not be earlier than opened_at")
+        history = ticket.get("transfer_history")
+        if history and transferred_at < history[-1]["transferred_at"]:
+            raise ValueError("transferred_at must not be earlier than the last transfer")
+        history = ticket.setdefault("transfer_history", [])
+        history.append({"from_assignee": ticket["assignee"], "to_assignee": assignee,
+                        "reason": reason, "transferred_at": transferred_at})
+        ticket["assignee"] = assignee
+        self._write(data)
+        return ticket
+
     def note(self, ticket_id, message):
         message = text(message, "message")
         return self._change(ticket_id, lambda t: t["notes"].append(message))
