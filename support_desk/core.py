@@ -124,12 +124,30 @@ class SupportDesk(JsonStore):
         message = text(message, "message")
         return self._change(ticket_id, lambda t: t["notes"].append(message))
 
-    def close(self, ticket_id, resolution):
+    def close(self, ticket_id, resolution, closed_at=None):
         resolution = text(resolution, "resolution")
+        if closed_at is not None:
+            closed_at = minute(closed_at, "closed_at")
         def apply(ticket):
             if not ticket["assignee"]:
                 raise ValueError("assign the ticket before closing")
+            if closed_at is not None:
+                earlier = []
+                if "opened_at" in ticket:
+                    earlier.append(ticket["opened_at"])
+                response = ticket.get("first_response")
+                if isinstance(response, dict) and response:
+                    earlier.append(response["responded_at"])
+                earlier.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
+                earlier.extend(message["received_at"] for message in ticket.get("customer_messages") or [])
+                earlier.extend(entry["transferred_at"] for entry in ticket.get("transfer_history") or [])
+                earlier.extend(entry["closed_at"] for entry in ticket.get("reopen_history") or []
+                               if "closed_at" in entry)
+                if earlier and closed_at < max(earlier):
+                    raise ValueError("closed_at must not be earlier than existing ticket times")
             ticket.update(status="closed", resolution=resolution)
+            if closed_at is not None:
+                ticket["closed_at"] = closed_at
         return self._change(ticket_id, apply)
 
     def reopen_ticket(self, ticket_id, reason):
@@ -138,8 +156,12 @@ class SupportDesk(JsonStore):
         ticket = data.get("tickets", {}).get(ticket_id)
         if ticket is None or ticket["status"] != "closed":
             raise ValueError("ticket must exist and be closed")
-        ticket.setdefault("reopen_history", []).append({"reason": reason, "resolution": ticket["resolution"]})
+        record = {"reason": reason, "resolution": ticket["resolution"]}
+        if "closed_at" in ticket:
+            record["closed_at"] = ticket["closed_at"]
+        ticket.setdefault("reopen_history", []).append(record)
         ticket.update(status="open", resolution=None)
+        ticket.pop("closed_at", None)
         self._write(data)
         return ticket
 
@@ -302,6 +324,34 @@ class SupportDesk(JsonStore):
             "responded": len(responded),
             "pending": len(timed) - len(responded),
             "untimed": len(tickets) - len(timed),
+            "average_minutes": sum(durations) / len(durations) if durations else None,
+            "max_minutes": max(durations) if durations else None,
+        }
+
+    def closure_report(self, as_of):
+        as_of = minute(as_of, "as_of")
+        durations = []
+        total = 0
+        timed = 0
+        for ticket in self._read().get("tickets", {}).values():
+            # Only currently closed tickets count; reopen history is never an extra closure.
+            if ticket["status"] != "closed":
+                continue
+            total += 1
+            opened_at = ticket.get("opened_at")
+            closed_at = ticket.get("closed_at")
+            if opened_at is not None and opened_at > as_of:
+                raise ValueError("opened_at must not be later than as_of")
+            if closed_at is not None and closed_at > as_of:
+                raise ValueError("closed_at must not be later than as_of")
+            if opened_at is not None and closed_at is not None:
+                timed += 1
+                durations.append(closed_at - opened_at)
+        return {
+            "as_of": as_of,
+            "total": total,
+            "timed": timed,
+            "untimed": total - timed,
             "average_minutes": sum(durations) / len(durations) if durations else None,
             "max_minutes": max(durations) if durations else None,
         }
