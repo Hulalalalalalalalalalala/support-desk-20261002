@@ -228,6 +228,31 @@ class SupportDesk(JsonStore):
         items.sort(key=lambda item: (item["ticket"]["opened_at"], item["ticket"]["ticket_id"]))
         return {"untimed": untimed, "items": items}
 
+    def follow_up_queue(self, as_of, target_minutes=60):
+        as_of = minute(as_of, "as_of")
+        target_minutes = positive(target_minutes, "target_minutes")
+        items = []
+        for ticket in self._read().get("tickets", {}).values():
+            if ticket["status"] == "closed":
+                continue
+            response = ticket.get("first_response")
+            if not response:
+                continue
+            if response["responded_at"] > as_of:
+                raise ValueError("responded_at must not be later than as_of")
+            replies = ticket.get("replies") or []
+            for reply in replies:
+                if reply["replied_at"] > as_of:
+                    raise ValueError("replied_at must not be later than as_of")
+            last_answered = replies[-1]["replied_at"] if replies else response["responded_at"]
+            waiting = as_of - last_answered
+            items.append({"ticket": ticket, "priority": ticket.get("priority", "normal"),
+                          "last_answered_at": last_answered, "waiting_minutes": waiting,
+                          "overdue": waiting > target_minutes})
+        items.sort(key=lambda item: (item["last_answered_at"], PRIORITY_RANK[item["priority"]],
+                                     item["ticket"]["ticket_id"]))
+        return {"as_of": as_of, "items": items}
+
     def response_target_report(self, as_of, targets=None):
         as_of = minute(as_of, "as_of")
         target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
