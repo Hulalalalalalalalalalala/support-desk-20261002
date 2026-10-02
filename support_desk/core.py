@@ -64,6 +64,62 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
+    def handover(self, source_assignee, assignees, reason, transferred_at, max_open=5):
+        source_assignee = text(source_assignee, "source_assignee")
+        reason = text(reason, "reason")
+        if not isinstance(assignees, list) or not assignees:
+            raise ValueError("assignees must be a nonempty array")
+        names = []
+        for element in assignees:
+            if not isinstance(element, str) or not element.strip():
+                raise ValueError("assignees elements must be nonblank strings")
+            names.append(element.strip())
+        if len(set(names)) != len(names):
+            raise ValueError("assignees must not contain duplicate names")
+        if source_assignee in names:
+            raise ValueError("assignees must not contain the source assignee")
+        transferred_at = minute(transferred_at, "transferred_at")
+        max_open = positive(max_open, "max_open")
+        data = self._read()
+        tickets = data.get("tickets", {})
+        def candidate_key(ticket):
+            opened_at = ticket.get("opened_at")
+            return (PRIORITY_RANK[ticket.get("priority", "normal")],
+                    opened_at is None, opened_at if opened_at is not None else 0,
+                    ticket["ticket_id"])
+        selected = sorted((ticket for ticket in tickets.values()
+                           if ticket["status"] == "open" and ticket.get("assignee") == source_assignee),
+                          key=candidate_key)
+        if not selected:
+            return []
+        loads = {name: 0 for name in names}
+        for ticket in tickets.values():
+            if ticket["status"] == "open" and ticket.get("assignee") in loads:
+                loads[ticket["assignee"]] += 1
+        plan = []
+        for ticket in selected:
+            available = [name for name in names if loads[name] < max_open]
+            if not available:
+                raise ValueError("assignees do not have enough capacity for all selected tickets")
+            chosen = min(available, key=lambda name: (loads[name], name))
+            loads[chosen] += 1
+            plan.append((ticket, chosen))
+        for ticket, chosen in plan:
+            if "opened_at" in ticket and transferred_at < ticket["opened_at"]:
+                raise ValueError("transferred_at must not be earlier than opened_at")
+            history = ticket.get("transfer_history")
+            if history and transferred_at < history[-1]["transferred_at"]:
+                raise ValueError("transferred_at must not be earlier than the last transfer")
+        handed_over = []
+        for ticket, chosen in plan:
+            ticket.setdefault("transfer_history", []).append(
+                {"from_assignee": ticket["assignee"], "to_assignee": chosen,
+                 "reason": reason, "transferred_at": transferred_at})
+            ticket["assignee"] = chosen
+            handed_over.append(ticket)
+        self._write(data)
+        return handed_over
+
     def note(self, ticket_id, message):
         message = text(message, "message")
         return self._change(ticket_id, lambda t: t["notes"].append(message))
