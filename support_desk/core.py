@@ -124,6 +124,52 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
+    def _reply_target(self, data, ticket_id):
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] == "closed":
+            raise ValueError("ticket must exist and be open")
+        if "opened_at" not in ticket:
+            raise ValueError("ticket has no opened_at")
+        if ticket.get("first_response") is None:
+            raise ValueError("ticket has no first response")
+        return ticket
+
+    def _check_reply_time(self, ticket, replied_at):
+        if replied_at < ticket["first_response"]["responded_at"]:
+            raise ValueError("replied_at must not be earlier than the first response")
+        replies = ticket.get("replies")
+        if replies and replied_at < replies[-1]["replied_at"]:
+            raise ValueError("replied_at must not be earlier than the last reply")
+
+    def reply(self, ticket_id, message, replied_at):
+        ticket_id, message = text(ticket_id, "ticket_id"), text(message, "message")
+        replied_at = minute(replied_at, "replied_at")
+        data = self._read()
+        ticket = self._reply_target(data, ticket_id)
+        self._check_reply_time(ticket, replied_at)
+        ticket.setdefault("replies", []).append({"message": message, "replied_at": replied_at})
+        self._write(data)
+        return ticket
+
+    def reply_with_knowledge(self, ticket_id, article_id, replied_at):
+        ticket_id, article_id = text(ticket_id, "ticket_id"), text(article_id, "article_id")
+        replied_at = minute(replied_at, "replied_at")
+        data = self._read()
+        ticket = self._reply_target(data, ticket_id)
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        if not data.get("knowledge_enabled", {}).get(article_id, True):
+            raise ValueError("knowledge article is disabled")
+        self._check_reply_time(ticket, replied_at)
+        ticket.setdefault("replies", []).append({
+            "message": entry["content"],
+            "replied_at": replied_at,
+            "knowledge": dict(entry),
+        })
+        self._write(data)
+        return ticket
+
     def response_stats(self):
         tickets = list(self._read().get("tickets", {}).values())
         timed = [t for t in tickets if "opened_at" in t]
