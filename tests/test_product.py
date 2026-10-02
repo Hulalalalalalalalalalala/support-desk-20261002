@@ -451,5 +451,230 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual(SupportDesk(self.root).get("T-other")["first_response"]["responded_at"], 6)
 
+    def _response_report_scenario(self):
+        # normal group: two responded tickets (30 and 31 minutes; the 31-minute one is closed)
+        self.app.open_ticket("T-responded-30", "Alice", "A", opened_at=70)
+        self.app.respond("T-responded-30", "On it", 100)
+        self.app.open_ticket("T-responded-31", "Bob", "B", opened_at=69)
+        self.app.assign("T-responded-31", "Eve")
+        self.app.respond("T-responded-31", "Done", 100)
+        self.app.close("T-responded-31", "Resolved")
+        # two pending tickets waiting 30 and 31 minutes
+        self.app.open_ticket("T-pending-30", "Cara", "C", opened_at=70)
+        self.app.open_ticket("T-pending-31", "Dan", "D", opened_at=69)
+        # one closed ticket without opened_at
+        self.app.open_ticket("T-untimed-closed", "Fay", "F")
+        self.app.assign("T-untimed-closed", "Gus")
+        self.app.close("T-untimed-closed", "Done")
+        # one closed ticket with opened_at but no first response
+        self.app.open_ticket("T-closed-unanswered", "Han", "G", opened_at=70)
+        self.app.assign("T-closed-unanswered", "Ivy")
+        self.app.close("T-closed-unanswered", "Closed anyway")
+
+    def _report_groups(self, report):
+        return {group["priority"]: group for group in report["groups"]}
+
+    def test_response_target_report_normal_counts_group_order_and_recreation(self):
+        self._response_report_scenario()
+        report = self.app.response_target_report(100)
+        self.assertEqual(report["as_of"], 100)
+        self.assertEqual([g["priority"] for g in report["groups"]],
+                         ["urgent", "high", "normal", "low"])
+        normal = self._report_groups(report)["normal"]
+        self.assertEqual(normal["target_minutes"], 30)
+        self.assertEqual((normal["responded"], normal["on_time"], normal["late"],
+                          normal["pending"], normal["overdue"], normal["untimed"],
+                          normal["closed_without_response"]), (2, 1, 1, 2, 1, 1, 1))
+        self.assertEqual(normal["on_time_rate"], 0.5)
+        for name in ("urgent", "high", "low"):
+            group = self._report_groups(report)[name]
+            self.assertEqual((group["responded"], group["on_time"], group["late"],
+                              group["pending"], group["overdue"], group["untimed"],
+                              group["closed_without_response"]), (0, 0, 0, 0, 0, 0, 0))
+            self.assertIsNone(group["on_time_rate"])
+        # recreating SupportDesk in the same directory gives the same report
+        recreated = SupportDesk(self.root).response_target_report(100)
+        self.assertEqual(recreated, report)
+        # read-only: no backfilled priority or clock fields, unchanged bytes
+        self.assertNotIn("priority", self.app.get("T-pending-30"))
+        self.assertNotIn("opened_at", self.app.get("T-untimed-closed"))
+        before = self.app.path.read_bytes()
+        self.app.response_target_report(100)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_response_target_report_override_normal_target_to_31(self):
+        self._response_report_scenario()
+        report = self.app.response_target_report(100, {"normal": 31})
+        groups = self._report_groups(report)
+        # uncovered priorities keep their default targets
+        self.assertEqual([groups[name]["target_minutes"] for name in ("urgent", "high", "normal", "low")],
+                         [5, 15, 31, 60])
+        normal = groups["normal"]
+        self.assertEqual((normal["responded"], normal["on_time"], normal["late"],
+                          normal["pending"], normal["overdue"], normal["untimed"],
+                          normal["closed_without_response"]), (2, 2, 0, 2, 0, 1, 1))
+        self.assertEqual(normal["on_time_rate"], 1.0)
+
+    def test_response_target_report_omitted_null_and_empty_targets_use_defaults(self):
+        self._response_report_scenario()
+        omitted = self.app.response_target_report(100)
+        self.assertEqual(self.app.response_target_report(100, None), omitted)
+        self.assertEqual(self.app.response_target_report(100, {}), omitted)
+        self.assertEqual([g["target_minutes"] for g in omitted["groups"]], [5, 15, 30, 60])
+
+    def test_response_target_report_old_tickets_default_to_normal_without_backfill(self):
+        self.app.open_ticket("T-old", "Alice", "Old", opened_at=70)
+        self.app.open_ticket("T-urgent", "Bob", "U", opened_at=0)
+        self.app.set_priority("T-urgent", "urgent")
+        self.app.respond("T-urgent", "Seen", 10)
+        groups = self._report_groups(self.app.response_target_report(100))
+        self.assertEqual((groups["urgent"]["responded"], groups["urgent"]["on_time"],
+                          groups["urgent"]["late"], groups["urgent"]["on_time_rate"]),
+                         (1, 0, 1, 0.0))
+        # 30-minute wait against the 30-minute normal target is not overdue
+        self.assertEqual((groups["normal"]["pending"], groups["normal"]["overdue"]), (1, 0))
+        self.assertNotIn("priority", self.app.get("T-old"))
+
+    def test_response_target_report_empty_data_is_all_zeros_and_creates_nothing(self):
+        report = self.app.response_target_report(0)
+        self.assertEqual(report["as_of"], 0)
+        self.assertEqual([g["priority"] for g in report["groups"]],
+                         ["urgent", "high", "normal", "low"])
+        self.assertEqual([g["target_minutes"] for g in report["groups"]], [5, 15, 30, 60])
+        for group in report["groups"]:
+            self.assertEqual((group["responded"], group["on_time"], group["late"],
+                              group["pending"], group["overdue"], group["untimed"],
+                              group["closed_without_response"]), (0, 0, 0, 0, 0, 0, 0))
+            self.assertIsNone(group["on_time_rate"])
+        self.assertFalse(self.app.path.exists())
+        # a query in a directory that does not exist creates neither directory nor file
+        missing = self.root / "missing"
+        fresh_report = SupportDesk(missing).response_target_report(0, {})
+        self.assertEqual(fresh_report, report)
+        self.assertFalse(missing.exists())
+
+    def test_response_target_report_allows_minutes_equal_to_as_of(self):
+        self.app.open_ticket("T-pending", "Alice", "A", opened_at=100)
+        self.app.open_ticket("T-closed", "Bob", "B", opened_at=90)
+        self.app.assign("T-closed", "Eve")
+        self.app.respond("T-closed", "Seen", 100)
+        self.app.close("T-closed", "Done")
+        normal = self._report_groups(self.app.response_target_report(100))["normal"]
+        self.assertEqual((normal["responded"], normal["pending"],
+                          normal["closed_without_response"], normal["on_time"]), (1, 1, 0, 1))
+
+    def test_response_target_report_rejects_future_opened_at_including_closed(self):
+        self.app.open_ticket("T-future-open", "Alice", "A", opened_at=101)
+        self.app.open_ticket("T-future-closed", "Bob", "B", opened_at=101)
+        self.app.assign("T-future-closed", "Eve")
+        self.app.close("T-future-closed", "Done")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.response_target_report(100)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_response_target_report_rejects_future_response_of_open_ticket(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=90)
+        self.app.respond("T", "Seen", 101)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.response_target_report(100)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_response_target_report_rejects_future_response_of_closed_ticket(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=90)
+        self.app.assign("T", "Eve")
+        self.app.respond("T", "Seen", 101)
+        self.app.close("T", "Done")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.response_target_report(100)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_response_target_report_rejects_bad_arguments_without_writing(self):
+        self._response_report_scenario()
+        before = self.app.path.read_bytes()
+        for as_of in (-1, True, 1.5, "100", None):
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.response_target_report(as_of)
+        bad_targets = [
+            [], "x", 5, True,                # non-object targets other than null
+            {"critical": 10},                # unknown priority key
+            {"normal": 0}, {"normal": -1},   # non-positive integers
+            {"normal": True},                # booleans are rejected even though int-like
+            {"normal": 30.0}, {"normal": "30"}, {"normal": None},
+        ]
+        for targets in bad_targets:
+            with self.assertRaises(ValueError, msg=targets):
+                self.app.response_target_report(100, targets)
+        with self.assertRaises(TypeError):
+            self.app.response_target_report()
+        with self.assertRaises(TypeError):
+            self.app.response_target_report(100, {}, extra=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # successful and failed queries leave every ticket structurally untouched
+        self.app.response_target_report(100)
+        with self.assertRaises(ValueError):
+            self.app.response_target_report(100, {"normal": 0})
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_cli_response_target_report(self):
+        self._response_report_scenario()
+        expected_counts = (2, 1, 1, 2, 1, 1, 1)
+        for body in ({"as_of": 100}, {"as_of": 100, "targets": None},
+                     {"as_of": 100, "targets": {}}):
+            payload = self.root / "report.json"
+            payload.write_text(json.dumps(body), encoding="utf-8")
+            result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "response-target-report", str(payload)], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            normal = self._report_groups(json.loads(result.stdout))["normal"]
+            self.assertEqual((normal["responded"], normal["on_time"], normal["late"],
+                              normal["pending"], normal["overdue"], normal["untimed"],
+                              normal["closed_without_response"]), expected_counts)
+        # an array runs a batch of independent queries and returns an array of reports
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([{"as_of": 100},
+                                     {"as_of": 100, "targets": {"normal": 31}}]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "response-target-report", str(batch)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reports = json.loads(result.stdout)
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(self._report_groups(reports[0])["normal"]["late"], 1)
+        self.assertEqual((self._report_groups(reports[1])["normal"]["on_time"],
+                          self._report_groups(reports[1])["normal"]["overdue"]), (2, 0))
+
+    def test_cli_response_target_report_failure_stops_batch_without_partial_output(self):
+        self._response_report_scenario()
+        before = self.app.path.read_bytes()
+        batch = self.root / "bad.json"
+        batch.write_text(json.dumps([{"as_of": 100}, {"as_of": -1}, {"as_of": 100}]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "response-target-report", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(failed.stdout, "")
+        # single-object failures and signature problems follow the same contract
+        for body in ({"as_of": 100, "targets": {"critical": 3}},
+                     {"as_of": 100, "targets": {"normal": 1.5}},
+                     {}, {"as_of": 100, "extra": 1}):
+            payload = self.root / "one.json"
+            payload.write_text(json.dumps(body), encoding="utf-8")
+            result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "response-target-report", str(payload)], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 2, body)
+            self.assertIn("error", json.loads(result.stderr))
+            self.assertEqual(result.stdout, "")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_cli_response_target_report_empty_directory_creates_nothing(self):
+        missing = self.root / "missing"
+        payload = self.root / "report.json"
+        payload.write_text(json.dumps({"as_of": 0}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(missing), "response-target-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual([g["priority"] for g in report["groups"]],
+                         ["urgent", "high", "normal", "low"])
+        self.assertEqual(sum(g["responded"] + g["pending"] for g in report["groups"]), 0)
+        self.assertFalse(missing.exists())
+
 if __name__ == "__main__":
     unittest.main()
