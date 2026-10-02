@@ -1,5 +1,8 @@
 from .storage import JsonStore, text, minute, positive
 
+PRIORITIES = ("urgent", "high", "normal", "low")
+PRIORITY_RANK = {name: index for index, name in enumerate(PRIORITIES)}
+
 class SupportDesk(JsonStore):
     def open_ticket(self, ticket_id, customer, subject, opened_at=None):
         ticket_id, customer, subject = text(ticket_id, "ticket_id"), text(customer, "customer"), text(subject, "subject")
@@ -47,6 +50,25 @@ class SupportDesk(JsonStore):
                 raise ValueError("assign the ticket before closing")
             ticket.update(status="closed", resolution=resolution)
         return self._change(ticket_id, apply)
+
+    def priority_queue(self):
+        items = [{"ticket": ticket, "priority": ticket.get("priority", "normal")}
+                 for ticket in self._read().get("tickets", {}).values()
+                 if ticket["status"] != "closed"]
+        items.sort(key=lambda item: (PRIORITY_RANK[item["priority"]], item["ticket"]["ticket_id"]))
+        return items
+
+    def set_priority(self, ticket_id, priority):
+        ticket_id, priority = text(ticket_id, "ticket_id"), text(priority, "priority")
+        if priority not in PRIORITY_RANK:
+            raise ValueError("priority must be one of low, normal, high, urgent")
+        data = self._read()
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] == "closed":
+            raise ValueError("ticket must exist and be open")
+        ticket["priority"] = priority
+        self._write(data)
+        return ticket
 
     def respond(self, ticket_id, message, responded_at):
         ticket_id, message = text(ticket_id, "ticket_id"), text(message, "message")

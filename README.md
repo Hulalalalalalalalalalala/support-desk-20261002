@@ -30,6 +30,8 @@ JSON 数组会按顺序执行多个独立操作；先前成功操作保留，后
 - `close` → `SupportDesk.close(...)`。参数名见 `core.py` 的公开方法签名。
 - `list` → `SupportDesk.list_tickets(...)`。参数名见 `core.py` 的公开方法签名。
 - `respond` → `SupportDesk.respond(...)`：登记首次响应，参数为 `ticket_id`、`message`、`responded_at`（非负整数分钟，不得早于 `opened_at`，相等允许），返回完整工单；不改变状态、指派、备注或解决说明。
+- `priority-set` → `SupportDesk.set_priority(ticket_id, priority)`：设置工单优先级，`priority` 仅限 `low`、`normal`、`high`、`urgent`。两个参数均须为非空字符串，先去除首尾空白再区分大小写匹配；只允许针对存在且未关闭的工单，成功返回完整工单并写入 `priority` 字段。重复设置相同值同样成功，不追加备注，不改变状态、指派、解决说明或首次响应记录。参数类型错误、去空白后为空、不支持的优先级、工单不存在或已关闭均报错且不写数据、不创建数据文件。
+- `priority-queue` → `SupportDesk.priority_queue()`：返回待处理队列数组，每项含 `ticket`（原样完整工单，不补字段）与 `priority`（有效优先级）。包含全部未关闭工单（已首次响应、未指派、无 `opened_at` 的均在内），排除已关闭工单；按 `urgent`、`high`、`normal`、`low` 排序，同级按 `ticket_id` 区分大小写升序。未设置 `priority` 的工单按 `normal` 排序。无工单、只有已关闭工单或数据目录不存在时返回 `[]`；只读，不创建目录、不写文件，可省略输入文件。
 - `response-stats` → `SupportDesk.response_stats()`：汇总首次响应耗时（`timed`、`responded`、`pending`、`untimed` 计数及 `average_minutes`、`max_minutes`），无参数，可省略输入文件，不写数据。
 - `response-queue` → `SupportDesk.response_queue(as_of, target_minutes=30)`：查看模拟时刻 `as_of`（非负整数分钟）仍待首次响应的工单队列，`target_minutes` 为正整数分钟。返回 `{"untimed": n, "items": [...]}`：未关闭且无首次响应且有 `opened_at` 的工单进入 `items`，每项含完整工单 `ticket`、`waiting_minutes`（`as_of - opened_at`）与 `overdue`（等待严格大于目标才为真），按 `opened_at` 升序、同分钟按 `ticket_id` 升序；缺少 `opened_at` 的待响应工单只计入 `untimed`。任一入队工单的 `opened_at` 晚于 `as_of` 则整个查询报错。只读，不写数据。
 - `knowledge-publish` → `SupportDesk.publish_knowledge(article_id, ticket_id)`：从已关闭工单发布知识条目，条目含 `article_id`、`source_ticket_id`、`title`（工单 subject）、`content`（工单 resolution）四个字段并返回完整条目。两个标识去除首尾空白、区分大小写；同一 root 内 `article_id` 唯一，每个工单只可发布一次。参数非字符串或去空白后为空、标识重复、工单已发布过、工单不存在或未关闭均报错且不写数据；来源工单保持原样，无 `opened_at` 或首次响应记录的已关闭工单也可发布。
