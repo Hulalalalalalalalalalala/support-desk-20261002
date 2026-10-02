@@ -220,6 +220,135 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stderr))
 
+    def test_assignee_workload_report_groups_and_counts(self):
+        self.app.open_ticket("T-pending", "Alice", "A", opened_at=10)
+        self.app.open_ticket("T-overdue", "Bob", "B", opened_at=5)
+        self.app.open_ticket("T-untimed", "Cara", "C")
+        self._responded("T-follow", 20)
+        self.app.reply("T-follow", "again", 70)
+        self._responded("T-follow-overdue", 10)
+        self._responded("T-closed", 5)
+        self.app.assign("T-closed", "Eve")
+        self.app.close("T-closed", "Done")
+        self.app.assign("T-pending", "bob")
+        self.app.assign("T-overdue", "Bob")
+        self.app.assign("T-follow", "Bob")
+        self.app.assign("T-follow-overdue", "alice")
+        report = self.app.assignee_workload_report(100)
+        self.assertEqual(set(report), {"as_of", "groups"})
+        self.assertEqual(report["as_of"], 100)
+        self.assertEqual([g["assignee"] for g in report["groups"]], [None, "Bob", "alice", "bob"])
+        rows = {g["assignee"]: g for g in report["groups"]}
+        self.assertEqual(rows[None], {"assignee": None, "open": 1, "pending": 0, "overdue": 0,
+                                      "follow_up": 0, "follow_up_overdue": 0, "untimed": 1})
+        self.assertEqual(rows["Bob"], {"assignee": "Bob", "open": 2, "pending": 1, "overdue": 1,
+                                       "follow_up": 1, "follow_up_overdue": 0, "untimed": 0})
+        self.assertEqual(rows["alice"], {"assignee": "alice", "open": 1, "pending": 0, "overdue": 0,
+                                         "follow_up": 1, "follow_up_overdue": 1, "untimed": 0})
+        self.assertEqual(rows["bob"], {"assignee": "bob", "open": 1, "pending": 1, "overdue": 1,
+                                       "follow_up": 0, "follow_up_overdue": 0, "untimed": 0})
+
+    def test_assignee_workload_report_overdue_boundaries_and_custom_targets(self):
+        self.app.open_ticket("T-exact", "Alice", "A", opened_at=70)
+        self.app.open_ticket("T-past", "Bob", "B", opened_at=69)
+        self._responded("T-follow-exact", 40)
+        self._responded("T-follow-past", 39)
+        self.app.assign("T-exact", "Eve")
+        self.app.assign("T-past", "Eve")
+        self.app.assign("T-follow-exact", "Eve")
+        self.app.assign("T-follow-past", "Eve")
+        group = self.app.assignee_workload_report(100)["groups"][0]
+        self.assertEqual((group["pending"], group["overdue"]), (2, 1))
+        self.assertEqual((group["follow_up"], group["follow_up_overdue"]), (2, 1))
+        custom = self.app.assignee_workload_report(100, response_minutes=31, follow_up_minutes=61)["groups"][0]
+        self.assertEqual((custom["overdue"], custom["follow_up_overdue"]), (0, 0))
+
+    def test_assignee_workload_report_null_empty_response_and_reply_fallback(self):
+        self.app.open_ticket("T-empty", "Alice", "A", opened_at=5)  # first_response forced to {}
+        data = self.app._read()
+        data["tickets"]["T-empty"]["first_response"] = {}
+        self.app._write(data)
+        self._responded("T-no-replies", 20)
+        data = self.app._read()
+        data["tickets"]["T-no-replies"]["replies"] = []
+        self.app._write(data)
+        ticket = self.app.open_ticket("T-untimed-response", "Bob", "B")
+        data = self.app._read()
+        data["tickets"]["T-untimed-response"]["first_response"] = {"message": "m", "responded_at": 30}
+        self.app._write(data)
+        report = self.app.assignee_workload_report(100, follow_up_minutes=75)
+        group = report["groups"][0]
+        self.assertIsNone(group["assignee"])
+        self.assertEqual((group["open"], group["pending"]), (3, 1))
+        # T-no-replies waits 80 from responded_at=20 (empty replies fall back), T-untimed-response waits 70
+        self.assertEqual((group["follow_up"], group["follow_up_overdue"]), (2, 1))
+        self.assertEqual(group["untimed"], 0)
+
+    def test_assignee_workload_report_reassign_close_and_reopen(self):
+        self._responded("T", 10)
+        self.app.assign("T", "Eve")
+        self.app.assign("T", "Gus")
+        self.assertEqual([g["assignee"] for g in self.app.assignee_workload_report(100)["groups"]], ["Gus"])
+        self.app.close("T", "Done")
+        self.assertEqual(self.app.assignee_workload_report(100)["groups"], [])
+        self.app.reopen_ticket("T", "back")
+        group = self.app.assignee_workload_report(100, follow_up_minutes=60)["groups"][0]
+        self.assertEqual((group["assignee"], group["follow_up"], group["follow_up_overdue"]), ("Gus", 1, 1))
+
+    def test_assignee_workload_report_rejects_future_times(self):
+        self.app.open_ticket("T-future-open", "Alice", "A", opened_at=200)
+        self._responded("T-future-reply", 10)
+        self.app.reply("T-future-reply", "later", 300)
+        self._responded("T-future-response", 10)
+        data = self.app._read()
+        data["tickets"]["T-future-response"]["first_response"]["responded_at"] = 400
+        self.app._write(data)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.assignee_workload_report(100)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # closed tickets do not participate in the check
+        for ticket_id in ("T-future-open", "T-future-reply", "T-future-response"):
+            self.app.assign(ticket_id, "Eve")
+            self.app.close(ticket_id, "Done")
+        self.assertEqual(self.app.assignee_workload_report(100)["groups"], [])
+
+    def test_assignee_workload_report_bad_arguments_and_signature(self):
+        for as_of in (True, 1.5, "40", None, -1):
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.assignee_workload_report(as_of)
+        for target in (0, -5, True, 30.0, "30", None):
+            with self.assertRaises(ValueError, msg=target):
+                self.app.assignee_workload_report(40, target)
+            with self.assertRaises(ValueError, msg=target):
+                self.app.assignee_workload_report(40, 30, target)
+        with self.assertRaises(TypeError):
+            self.app.assignee_workload_report()
+        with self.assertRaises(TypeError):
+            self.app.assignee_workload_report(40, bogus=1)
+
+    def test_assignee_workload_report_empty_directory_creates_no_file(self):
+        report = self.app.assignee_workload_report(0)
+        self.assertEqual(report, {"as_of": 0, "groups": []})
+        self.assertFalse(self.app.path.exists())
+
+    def test_cli_assignee_workload_report(self):
+        self.app.open_ticket("T-1", "Alice", "A", opened_at=9)
+        self.app.assign("T-1", "Eve")
+        payload = self.root / "query.json"
+        payload.write_text(json.dumps({"as_of": 40}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "assignee-workload-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value, {"as_of": 40, "groups": [{"assignee": "Eve", "open": 1, "pending": 1,
+                                                          "overdue": 1, "follow_up": 0,
+                                                          "follow_up_overdue": 0, "untimed": 0}]})
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"as_of": -1}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "assignee-workload-report", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+
     def _closed_ticket(self, ticket_id="T", subject="Download", resolution="Sent link"):
         self.app.open_ticket(ticket_id, "Alice", subject)
         self.app.assign(ticket_id, "Bob")
