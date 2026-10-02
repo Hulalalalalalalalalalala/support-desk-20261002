@@ -1588,5 +1588,431 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), [])
         self.assertFalse(missing.exists())
 
+    def _search_field_scenario(self):
+        # A handful of independent tickets; each unique keyword lives in exactly
+        # one searchable place. Times are local simulated minutes.
+        self.app.open_ticket("T-customer", "Custkw Anderson", "Subject one")
+        self.app.open_ticket("T-subject", "Alice", "Subjkw request")
+        self.app.open_ticket("T-note", "Bob", "Subject two")
+        self.app.note("T-note", "Notekw recorded")
+        self.app.open_ticket("T-resolution", "Carol", "Subject three")
+        self.app.assign("T-resolution", "Eve")
+        self.app.close("T-resolution", "Resolkw finished")
+        self.app.open_ticket("T-response", "Dan", "Subject four", opened_at=5)
+        self.app.respond("T-response", "Firstkw first reply body", 6)
+        self.app.reply("T-response", "Replykw later reply body", 7)
+
+    def _search_ids(self, query, **kwargs):
+        return [ticket["ticket_id"] for ticket in self.app.search_tickets(query, **kwargs)["items"]]
+
+    def test_search_tickets_matches_every_searchable_field_and_returns_full_tickets(self):
+        self._search_field_scenario()
+        self.assertEqual(self._search_ids("CUSTKW"), ["T-customer"])
+        self.assertEqual(self._search_ids("subjkw"), ["T-subject"])
+        self.assertEqual(self._search_ids("NOTEKW"), ["T-note"])
+        # a closed ticket is searched, and the resolution participates
+        self.assertEqual(self._search_ids("resolkw"), ["T-resolution"])
+        self.assertEqual(self._search_ids("firstkw"), ["T-response"])
+        self.assertEqual(self._search_ids("replykw"), ["T-response"])
+        # terms may land in different records: first response body and a later reply
+        self.assertEqual(self._search_ids("firstkw replykw"), ["T-response"])
+        # each term must fit one ticket: no ticket carries both of these keywords
+        self.assertEqual(self._search_ids("custkw subjkw"), [])
+        # items are complete stored tickets, total counts before pagination
+        result = self.app.search_tickets("firstkw")
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"], [self.app.get("T-response")])
+        self.assertEqual(result["items"][0]["replies"][-1]["message"], "Replykw later reply body")
+
+    def test_search_tickets_knowledge_matches_saved_message_bodies_not_snapshot_fields(self):
+        self._closed_ticket("T-src", subject="Source subject", resolution="Knowkw saved body")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T-kr", "Alice", "Need help", opened_at=5)
+        self.app.respond_with_knowledge("T-kr", "KB-1", 6)
+        self.app.reply_with_knowledge("T-kr", "KB-1", 7)
+        # the saved content is searchable through both the first response and a reply
+        self.assertEqual(self._search_ids("knowkw"), ["T-kr", "T-src"])
+        saved = self.app.get("T-kr")
+        self.assertEqual(saved["first_response"]["message"], "Knowkw saved body")
+        self.assertEqual(saved["replies"][-1]["message"], "Knowkw saved body")
+        # snapshot metadata and the source ticket id never participate:
+        # "kb-1"/"T-src" appear only inside the snapshot and the source ticket's id,
+        # and the snapshot title "Source subject" is not indexed for T-kr
+        for term in ("kb-1", "t-src", "source", "source subject"):
+            self.assertEqual(self._search_ids(term), ["T-src"] if "source" in term else [], term)
+
+    def test_search_tickets_trims_splits_on_whitespace_casefolds_and_matches_punctuation_literally(self):
+        self.app.open_ticket("T-cf", "Nina", "Reset PASSWORD Straße")
+        self.app.open_ticket("T-p", "Owen", "Done, finally.")
+        self.app.open_ticket("T-z", "客户甲", "无法登录，请重试")
+        ids = self._search_ids
+        # ends are trimmed, remaining whitespace splits terms, term order is irrelevant
+        self.assertEqual(ids("  password  reset "), ["T-cf"])
+        self.assertEqual(ids("\tPASSWORD\n straße "), ["T-cf"])
+        # Unicode casefold works in both directions
+        self.assertEqual(ids("STRASSE"), ["T-cf"])
+        self.assertEqual(ids("straße"), ["T-cf"])
+        self.assertEqual(ids("strasse"), ["T-cf"])
+        self.assertEqual(ids("NINA"), ["T-cf"])
+        # punctuation is matched literally, including Chinese punctuation
+        self.assertEqual(ids("done,"), ["T-p"])
+        self.assertEqual(ids("finally."), ["T-p"])
+        self.assertEqual(ids("finally,"), [])
+        self.assertEqual(ids("登录，请"), ["T-z"])
+        self.assertEqual(ids("登录,请"), [])
+        # a single term must be contiguous; it cannot bridge a gap inside one field
+        self.assertEqual(ids("etpass"), [])
+        self.assertEqual(ids("resetpassword"), [])
+
+    def test_search_tickets_terms_do_not_cross_fields_or_records(self):
+        self.app.open_ticket("T-a", "Zed", "Alpha")
+        self.app.note("T-a", "Beta")
+        self.app.open_ticket("T-b", "Beta Person", "Gamma")
+        self.app.open_ticket("T-c", "foot", "Other")
+        self.app.note("T-c", "ball")
+        self.app.open_ticket("T-d", "Qux", "foo", opened_at=5)
+        self.app.respond("T-d", "first", 6)
+        self.app.reply("T-d", "bar one", 7)
+        self.app.reply("T-d", "two baz", 8)
+        ids = self._search_ids
+        # different terms may match different fields of one ticket ...
+        self.assertEqual(ids("alpha beta"), ["T-a"])
+        # ... and different reply records of one ticket ...
+        self.assertEqual(ids("bar baz"), ["T-d"])
+        # ... but one term cannot be glued across two fields or two records
+        self.assertEqual(ids("football"), [])
+        self.assertEqual(ids("barbaz"), [])
+        # alpha belongs only to T-a, gamma only to T-b
+        self.assertEqual(ids("alpha gamma"), [])
+
+    def test_search_tickets_ignores_ticket_id_assignee_category(self):
+        self.app.open_ticket("T-secret", "Alice", "Visible words")
+        self.app.assign("T-secret", "uniquename_zoe")
+        self.app.set_category("T-secret", "uniquecat_zeta")
+        for term in ("zoe", "zeta", "uniquename_zoe", "uniquecat_zeta", "t-secret", "T-SECRET"):
+            self.assertEqual(self._search_ids(term), [], term)
+        self.assertEqual(self._search_ids("visible"), ["T-secret"])
+
+    def _search_filter_scenario(self):
+        # five tickets sharing one searchable word, spanning status and category
+        self.app.open_ticket("T-1", "Alice", "Sharedword item")
+        self.app.set_category("T-1", "billing")
+        self.app.open_ticket("T-2", "Bob", "Sharedword item")
+        self.app.set_category("T-2", "billing")
+        self.app.assign("T-2", "Eve")
+        self.app.close("T-2", "Done")
+        self.app.open_ticket("T-3", "Carol", "Sharedword item")
+        self.app.set_category("T-3", "network")
+        self.app.open_ticket("T-4", "Dan", "Sharedword item")
+        self.app.assign("T-4", "Fay")
+        self.app.close("T-4", "Done")
+        self.app.open_ticket("T-5", "Gus", "Sharedword item")
+
+    def test_search_tickets_status_and_category_apply_as_intersection(self):
+        self._search_filter_scenario()
+        all_ids = ["T-1", "T-2", "T-3", "T-4", "T-5"]
+        self.assertEqual(self._search_ids("sharedword"), all_ids)
+        self.assertEqual(self._search_ids("sharedword", status=None), all_ids)
+        self.assertEqual(self._search_ids("sharedword", status="open"), ["T-1", "T-3", "T-5"])
+        self.assertEqual(self._search_ids("sharedword", status="closed"), ["T-2", "T-4"])
+        self.assertEqual(self._search_ids("sharedword", category="billing"), ["T-1", "T-2"])
+        self.assertEqual(self._search_ids("sharedword", category="network"), ["T-3"])
+        self.assertEqual(self._search_ids("sharedword", category=None), ["T-4", "T-5"])
+        # the two conditions intersect
+        self.assertEqual(self._search_ids("sharedword", status="open", category="billing"), ["T-1"])
+        self.assertEqual(self._search_ids("sharedword", status="closed", category="billing"), ["T-2"])
+        self.assertEqual(self._search_ids("sharedword", status="open", category="network"), ["T-3"])
+        self.assertEqual(self._search_ids("sharedword", status="open", category=None), ["T-5"])
+        self.assertEqual(self._search_ids("sharedword", status="closed", category=None), ["T-4"])
+        self.assertEqual(self._search_ids("sharedword", category="missing"), [])
+        result = self.app.search_tickets("sharedword", status="closed", category="billing")
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["status"], "closed")
+        self.assertEqual(result["items"][0]["category"], "billing")
+
+    def test_search_tickets_category_omitted_null_trimming_case_and_internal_space(self):
+        self._search_filter_scenario()
+        self.app.open_ticket("T-6", "Han", "Sharedword item")
+        self.app.set_category("T-6", "bill ing")
+        # omitted category imposes no restriction; explicit null means uncategorized only
+        self.assertEqual(self._search_ids("sharedword"),
+                         ["T-1", "T-2", "T-3", "T-4", "T-5", "T-6"])
+        self.assertEqual(self._search_ids("sharedword", category=None), ["T-4", "T-5"])
+        # ends are trimmed; comparison is case sensitive; internal whitespace is kept
+        self.assertEqual(self._search_ids("sharedword", category=" billing "), ["T-1", "T-2"])
+        self.assertEqual(self._search_ids("sharedword", category="bill ing"), ["T-6"])
+        self.assertEqual(self._search_ids("sharedword", category=" bill ing "), ["T-6"])
+        self.assertEqual(self._search_ids("sharedword", category="bill  ing"), [])
+        self.assertEqual(self._search_ids("sharedword", category="Billing"), [])
+        for bad in (1, True, [], {}, " ", "\t"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.app.search_tickets("sharedword", category=bad)
+
+    def test_search_tickets_sorts_by_case_sensitive_ticket_id_before_paginating(self):
+        for ticket_id in ("t-a2", "a", "T-b", "B", "T-a1"):
+            self.app.open_ticket(ticket_id, "Alice", "Pagedkw content")
+        ordered = ["B", "T-a1", "T-b", "a", "t-a2"]
+        self.assertEqual(self._search_ids("pagedkw"), ordered)
+        self.assertEqual(self._search_ids("pagedkw", limit=2), ordered[:2])
+        self.assertEqual(self._search_ids("pagedkw", offset=2, limit=2), ordered[2:4])
+        self.assertEqual(self._search_ids("pagedkw", offset=4), [ordered[-1]])
+        result = self.app.search_tickets("pagedkw", offset=3)
+        self.assertEqual(result["total"], 5)
+        self.assertEqual([t["ticket_id"] for t in result["items"]], ordered[3:])
+        # total is the pre-pagination count even when the page is empty
+        beyond = self.app.search_tickets("pagedkw", offset=5)
+        self.assertEqual(beyond, {"total": 5, "items": []})
+
+    def test_search_tickets_pagination_defaults_limit_100_and_offset_beyond_total(self):
+        for index in range(1, 26):
+            self.app.open_ticket("T-%02d" % index, "Alice", "Manykw content %d" % index)
+        ordered = ["T-%02d" % index for index in range(1, 26)]
+        default = self.app.search_tickets("manykw")
+        self.assertEqual((default["total"], len(default["items"])), (25, 20))
+        self.assertEqual([t["ticket_id"] for t in default["items"]], ordered[:20])
+        self.assertEqual(self._search_ids("manykw", offset=0), ordered[:20])
+        self.assertEqual(self._search_ids("manykw", offset=20), ordered[20:])
+        self.assertEqual(self._search_ids("manykw", offset=24), ["T-25"])
+        self.assertEqual(self.app.search_tickets("manykw", offset=25),
+                         {"total": 25, "items": []})
+        self.assertEqual(self.app.search_tickets("manykw", offset=100),
+                         {"total": 25, "items": []})
+        # the maximum page length is accepted and returns everything
+        full = self.app.search_tickets("manykw", limit=100)
+        self.assertEqual((full["total"], [t["ticket_id"] for t in full["items"]]), (25, ordered))
+        self.assertEqual(self._search_ids("manykw", limit=1), ["T-01"])
+
+    def test_search_tickets_no_match_and_empty_data(self):
+        self.assertEqual(self.app.search_tickets("anything"), {"total": 0, "items": []})
+        self.assertFalse(self.app.path.exists())
+        self.app.open_ticket("T", "Alice", "Real content")
+        self.assertEqual(self.app.search_tickets("zzz nomatch"), {"total": 0, "items": []})
+
+    def test_search_tickets_legacy_tickets_missing_category_replies_or_empty_first_response(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        doc = {"tickets": {
+            "L-open": {"ticket_id": "L-open", "customer": "Legacy Cust",
+                       "subject": "Legkw open plain", "status": "open",
+                       "assignee": None, "notes": [], "resolution": None},
+            "L-closed": {"ticket_id": "L-closed", "customer": "Legacy Cust",
+                         "subject": "Legkw closed plain", "status": "closed",
+                         "assignee": "a", "notes": ["Legnotekw inside"],
+                         "resolution": "Legreskw fixed"},
+            "L-nullfr": {"ticket_id": "L-nullfr", "customer": "Legacy Cust",
+                         "subject": "Legkw null response", "status": "open",
+                         "assignee": None, "notes": [], "resolution": None,
+                         "opened_at": 3, "first_response": None},
+            "L-empty": {"ticket_id": "L-empty", "customer": "Legacy Cust",
+                        "subject": "Legkw empty response", "status": "open",
+                        "assignee": None, "notes": [], "resolution": None,
+                        "opened_at": 3, "first_response": {},
+                        "replies": [{"message": "", "replied_at": 9},
+                                    {"message": "Legreplykw here", "replied_at": 10}]},
+        }}
+        path = legacy / "data.json"
+        path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        app = SupportDesk(legacy)
+        self.assertEqual(app.search_tickets("legkw")["total"], 4)
+        self.assertEqual([t["ticket_id"] for t in app.search_tickets("legkw")["items"]],
+                         ["L-closed", "L-empty", "L-nullfr", "L-open"])
+        self.assertEqual([t["ticket_id"] for t in app.search_tickets("legkw", status="open")["items"]],
+                         ["L-empty", "L-nullfr", "L-open"])
+        self.assertEqual([t["ticket_id"] for t in app.search_tickets("legkw", category=None)["items"]],
+                         ["L-closed", "L-empty", "L-nullfr", "L-open"])
+        self.assertEqual([t["ticket_id"] for t in app.search_tickets(
+            "legkw", status="closed", category=None)["items"]], ["L-closed"])
+        self.assertEqual(app.search_tickets("legnotekw")["items"][0]["ticket_id"], "L-closed")
+        self.assertEqual(app.search_tickets("legreskw")["items"][0]["ticket_id"], "L-closed")
+        self.assertEqual(app.search_tickets("legreplykw")["items"][0]["ticket_id"], "L-empty")
+        # empty first response / reply messages neither match nor break the query
+        self.assertEqual(app.search_tickets("legkw", status="open")["total"], 3)
+        # raw tickets are returned whole with no backfilled fields
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        for ticket_id in ("L-open", "L-closed", "L-nullfr", "L-empty"):
+            self.assertEqual(app.get(ticket_id), raw["tickets"][ticket_id])
+        self.assertNotIn("category", raw["tickets"]["L-closed"])
+        self.assertNotIn("replies", raw["tickets"]["L-closed"])
+        before = path.read_bytes()
+        app.search_tickets("legkw")
+        app.search_tickets("legreplykw", status="open", category=None, offset=1, limit=1)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_search_tickets_knowledge_revisions_restore_and_disable_keep_saved_results(self):
+        self._closed_ticket("T-src", subject="Old title zeta", resolution="Knowkw saved body")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T-kr", "Alice", "Need help", opened_at=5)
+        self.app.respond_with_knowledge("T-kr", "KB-1", 6)
+        self.app.reply_with_knowledge("T-kr", "KB-1", 7)
+        self.assertEqual(self._search_ids("knowkw"), ["T-kr", "T-src"])
+        # revising the article never rewrites saved reply bodies
+        self.app.update_knowledge("KB-1", "Brand title", "Brandkw new body")
+        self.assertEqual(self._search_ids("knowkw"), ["T-kr", "T-src"])
+        self.assertEqual(self._search_ids("brandkw"), [])
+        # a response saved after the revision is hit through its own saved body
+        self.app.open_ticket("T-new", "Bob", "Other", opened_at=10)
+        self.app.respond_with_knowledge("T-new", "KB-1", 11)
+        self.assertEqual(self._search_ids("brandkw"), ["T-new"])
+        # restoring an older revision and disabling the article leave existing replies indexed
+        self.app.restore_knowledge("KB-1", 1)
+        self.app.set_knowledge_enabled("KB-1", False)
+        self.assertEqual(self._search_ids("knowkw"), ["T-kr", "T-src"])
+        self.assertEqual(self._search_ids("brandkw"), ["T-new"])
+        saved = self.app.get("T-kr")
+        self.assertEqual(saved["first_response"]["message"], "Knowkw saved body")
+        self.assertEqual([r["message"] for r in saved["replies"]], ["Knowkw saved body"])
+
+    def test_search_tickets_rejects_bad_arguments_without_writing(self):
+        self._search_field_scenario()
+        before = self.app.path.read_bytes()
+        for query in (None, 1, 1.5, True, [], {}, " ", "  \t\n "):
+            with self.assertRaises(ValueError, msg=query):
+                self.app.search_tickets(query)
+        for status in ("OPEN", "closed ", "", 0, 1, True, [], {}):
+            with self.assertRaises(ValueError, msg=status):
+                self.app.search_tickets("custkw", status=status)
+        for category in (1, True, [], {}, " ", "\t"):
+            with self.assertRaises(ValueError, msg=category):
+                self.app.search_tickets("custkw", category=category)
+        for offset in (True, False, 1.0, -1, "0", None, 1.5):
+            with self.assertRaises(ValueError, msg=offset):
+                self.app.search_tickets("custkw", offset=offset)
+        for limit in (True, False, 20.0, "20", None, 0, 101, -1):
+            with self.assertRaises(ValueError, msg=limit):
+                self.app.search_tickets("custkw", limit=limit)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_search_tickets_missing_query_and_unknown_arguments_raise_type_error(self):
+        with self.assertRaises(TypeError):
+            self.app.search_tickets()
+        with self.assertRaises(TypeError):
+            self.app.search_tickets(status="open")
+        with self.assertRaises(TypeError):
+            self.app.search_tickets("custkw", unknown=1)
+        with self.assertRaises(TypeError):
+            self.app.search_tickets("custkw", 0, "billing", 0, 20, "extra")
+
+    def test_search_tickets_is_read_only_success_and_failure_never_create_files(self):
+        self._search_filter_scenario()
+        before = self.app.path.read_bytes()
+        for kwargs in (
+            {}, {"status": "open"}, {"status": "closed"}, {"category": None},
+            {"category": "billing"}, {"status": "closed", "category": "billing"},
+            {"offset": 2, "limit": 1}, {"offset": 50}, {"limit": 100},
+        ):
+            self.app.search_tickets("sharedword", **kwargs)
+        with self.assertRaises(ValueError):
+            self.app.search_tickets(" ")
+        with self.assertRaises(ValueError):
+            self.app.search_tickets("sharedword", status="nope")
+        with self.assertRaises(ValueError):
+            self.app.search_tickets("sharedword", offset=-1)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # queries against a directory that does not exist create neither it nor data.json
+        missing = self.root / "missing"
+        fresh = SupportDesk(missing)
+        self.assertEqual(fresh.search_tickets("anything"), {"total": 0, "items": []})
+        with self.assertRaises(ValueError):
+            fresh.search_tickets(" ")
+        with self.assertRaises(ValueError):
+            fresh.search_tickets("anything", limit=0)
+        self.assertFalse(missing.exists())
+
+    def test_search_tickets_results_are_consistent_after_recreating_desk(self):
+        self._search_filter_scenario()
+        for kwargs in (
+            {}, {"status": "open"}, {"category": None}, {"category": "billing"},
+            {"status": "closed", "category": "billing"}, {"offset": 1, "limit": 2},
+        ):
+            self.assertEqual(SupportDesk(self.root).search_tickets("sharedword", **kwargs),
+                             self.app.search_tickets("sharedword", **kwargs))
+
+    def _cli_search(self, body):
+        payload = self.root / "search-input.json"
+        payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        return subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                               str(self.root), "ticket-search", str(payload)],
+                              text=True, capture_output=True)
+
+    def test_cli_ticket_search_object_and_array_preserve_input_order(self):
+        self._search_filter_scenario()
+        result = self._cli_search({"query": "sharedword", "status": "open"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         self.app.search_tickets("sharedword", status="open"))
+        # a null category survives the JSON boundary
+        result = self._cli_search({"query": "sharedword", "category": None})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([t["ticket_id"] for t in json.loads(result.stdout)["items"]], ["T-4", "T-5"])
+        requests = [
+            {"query": "sharedword", "status": "closed"},
+            {"query": "sharedword", "limit": 1},
+            {"query": "sharedword", "offset": 3, "limit": 1},
+        ]
+        payload = self.root / "batch.json"
+        payload.write_text(json.dumps(requests), encoding="utf-8")
+        batch = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                str(self.root), "ticket-search", str(payload)],
+                               text=True, capture_output=True)
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        rows = json.loads(batch.stdout)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([t["ticket_id"] for t in rows[0]["items"]], ["T-2", "T-4"])
+        self.assertEqual([t["ticket_id"] for t in rows[1]["items"]], ["T-1"])
+        self.assertEqual([t["ticket_id"] for t in rows[2]["items"]], ["T-4"])
+        self.assertEqual([row["total"] for row in rows], [2, 5, 5])
+
+    def test_cli_ticket_search_failure_exits_2_with_empty_stdout_and_stops_batch(self):
+        self._search_filter_scenario()
+        for body in (
+            {"query": " "},
+            {"query": "sharedword", "status": "nope"},
+            {},
+            {"query": "sharedword", "unknown": 1},
+            {"query": "sharedword", "offset": -1},
+            {"query": "sharedword", "limit": True},
+            {"query": 123},
+        ):
+            result = self._cli_search(body)
+            self.assertEqual(result.returncode, 2, body)
+            self.assertEqual(result.stdout, "", body)
+            self.assertIn("error", json.loads(result.stderr), body)
+        # a failure mid-array prints no partial results at all
+        payload = self.root / "bad-batch.json"
+        payload.write_text(json.dumps([{"query": "sharedword"},
+                                       {"query": "sharedword", "limit": 0},
+                                       {"query": "sharedword"}]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "ticket-search", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
+    def test_cli_ticket_search_missing_root_and_read_only(self):
+        self._search_filter_scenario()
+        before = self.app.path.read_bytes()
+        result = self._cli_search({"query": "sharedword"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        missing = self.root / "missing"
+        payload = self.root / "empty-query.json"
+        payload.write_text(json.dumps({"query": "anything"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(missing), "ticket-search", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"total": 0, "items": []})
+        self.assertFalse(missing.exists())
+        bad = self.root / "bad-query.json"
+        bad.write_text(json.dumps({"query": " "}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(missing), "ticket-search", str(bad)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertFalse(missing.exists())
+
 if __name__ == "__main__":
     unittest.main()
