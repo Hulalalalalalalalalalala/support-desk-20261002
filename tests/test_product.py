@@ -1588,5 +1588,311 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), [])
         self.assertFalse(missing.exists())
 
+class TicketSearchTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = SupportDesk(self.root)
+
+    def _search_scenario(self):
+        # T-01: open, categorized, timed; searchable via customer, subject, note,
+        # first response and follow-up reply
+        self.app.open_ticket("T-01", "Alice 李", "VPN 连接失败", opened_at=5)
+        self.app.assign("T-01", "小林")
+        self.app.note("T-01", "客户已重启路由器")
+        self.app.set_category("T-01", "network")
+        self.app.respond("T-01", "请检查 DNS 设置", 6)
+        self.app.reply("T-01", "已切换备用节点", 7)
+        # T-02: open, category keeps internal whitespace; searchable via a note
+        self.app.open_ticket("T-02", "Bob", "发票抬头修改", opened_at=10)
+        self.app.note("T-02", "需要重新开具发票")
+        self.app.set_category("T-02", " VIP 客户 ")
+        # T-03: closed, searchable via its resolution
+        self.app.open_ticket("T-03", "Cara", "密码重置", opened_at=1)
+        self.app.assign("T-03", "小林")
+        self.app.close("T-03", "已发送重置链接")
+        # T-src: closed knowledge source; T-04: answered from the knowledge article
+        self.app.open_ticket("T-src", "Fay", "下载指引")
+        self.app.assign("T-src", "小林")
+        self.app.close("T-src", "使用离线安装包")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T-04", "Dan", "无法下载", opened_at=3)
+        self.app.respond_with_knowledge("T-04", "KB-1", 4)
+        self.app.reply_with_knowledge("T-04", "KB-1", 5)
+        # T-05: untimed and uncategorized
+        self.app.open_ticket("T-05", "Eve", "VPN 账号申请")
+
+    def test_search_tickets_matches_every_searchable_field(self):
+        self._search_scenario()
+        cases = [
+            ("alice", ["T-01"]),       # customer, casefold-insensitive
+            ("李", ["T-01"]),          # customer, non-ASCII
+            ("vpn", ["T-01", "T-05"]),  # subject, sorted by ticket_id
+            ("路由器", ["T-01"]),       # a note entry
+            ("重置链接", ["T-03"]),      # resolution of a closed ticket
+            ("dns", ["T-01"]),         # first response body
+            ("备用节点", ["T-01"]),      # follow-up reply body
+        ]
+        for query, expected in cases:
+            result = self.app.search_tickets(query)
+            self.assertEqual([t["ticket_id"] for t in result["items"]], expected, msg=query)
+            self.assertEqual(result["total"], len(expected), msg=query)
+        # items are the complete stored tickets
+        self.assertEqual(self.app.search_tickets("dns")["items"][0], self.app.get("T-01"))
+
+    def test_search_tickets_term_splitting_casefold_and_punctuation(self):
+        self._search_scenario()
+        # ends are stripped and terms split on any whitespace run
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("  VPN\t连接 ")["items"]],
+                         ["T-01"])
+        # different terms may hit different fields of the same ticket
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("Alice DNS")["items"]],
+                         ["T-01"])
+        # ... and different records of the same ticket
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("alice 备用节点")["items"]],
+                         ["T-01"])
+        # every term must match somewhere
+        self.assertEqual(self.app.search_tickets("vpn 不存在词"), {"total": 0, "items": []})
+        # a single term cannot be pieced together across fields or records
+        self.assertEqual(self.app.search_tickets("李VPN"), {"total": 0, "items": []})
+        self.assertEqual(self.app.search_tickets("设置已切换"), {"total": 0, "items": []})
+        # punctuation is matched literally
+        self.assertEqual(self.app.search_tickets("DNS,"), {"total": 0, "items": []})
+        self.assertEqual(self.app.search_tickets("连接失败。"), {"total": 0, "items": []})
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("连接失败")["items"]],
+                         ["T-01"])
+
+    def test_search_tickets_ignores_identifiers_assignee_category_and_snapshot(self):
+        self._search_scenario()
+        for query in ["T-01", "T-src", "小林", "network", "VIP", "KB-1"]:
+            self.assertEqual(self.app.search_tickets(query), {"total": 0, "items": []}, msg=query)
+
+    def test_search_tickets_status_and_category_filters_intersect(self):
+        self._search_scenario()
+        # status omitted or null includes both open and closed
+        both = ["T-04", "T-src"]
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("下载")["items"]], both)
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("下载", status=None)["items"]], both)
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("下载", status="open")["items"]],
+                         ["T-04"])
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("下载", status="closed")["items"]],
+                         ["T-src"])
+        # category omitted means no restriction; explicit null matches only uncategorized
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("vpn")["items"]],
+                         ["T-01", "T-05"])
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("vpn", category=None)["items"]],
+                         ["T-05"])
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("vpn", category="network")["items"]],
+                         ["T-01"])
+        # category strings are stripped, case-sensitive and keep internal whitespace
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("vpn", category=" network ")["items"]],
+                         ["T-01"])
+        self.assertEqual(self.app.search_tickets("vpn", category="Network"), {"total": 0, "items": []})
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("发票", category=" VIP 客户 ")["items"]],
+                         ["T-02"])
+        self.assertEqual(self.app.search_tickets("发票", category="VIP  客户"), {"total": 0, "items": []})
+        # status and category apply as an intersection
+        self.assertEqual([t["ticket_id"] for t in
+                          self.app.search_tickets("下载", status="open", category=None)["items"]], ["T-04"])
+        self.assertEqual([t["ticket_id"] for t in
+                          self.app.search_tickets("下载", status="closed", category=None)["items"]], ["T-src"])
+        self.assertEqual(self.app.search_tickets("下载", status="closed", category="network"),
+                         {"total": 0, "items": []})
+
+    def test_search_tickets_pagination_and_case_sensitive_order(self):
+        for i in range(25):
+            self.app.open_ticket("T-%02d" % i, "Alice", "bulk issue")
+        self.app.open_ticket("T-b", "Bob", "bulk issue")
+        self.app.open_ticket("T-A", "Cara", "bulk issue")
+        # default offset 0 and default limit 20; total counts matches before paging
+        result = self.app.search_tickets("bulk")
+        self.assertEqual(result["total"], 27)
+        self.assertEqual([t["ticket_id"] for t in result["items"]], ["T-%02d" % i for i in range(20)])
+        # limit 1 and 100 are both accepted
+        self.assertEqual(len(self.app.search_tickets("bulk", limit=1)["items"]), 1)
+        everything = self.app.search_tickets("bulk", limit=100)
+        self.assertEqual(len(everything["items"]), 27)
+        # ordering is case-sensitive: digits, then uppercase, then lowercase
+        self.assertEqual([t["ticket_id"] for t in everything["items"]][-2:], ["T-A", "T-b"])
+        # offset slices the sorted matches
+        page = self.app.search_tickets("bulk", offset=25, limit=2)
+        self.assertEqual([t["ticket_id"] for t in page["items"]], ["T-A", "T-b"])
+        self.assertEqual(page["total"], 27)
+        # offset at or beyond the total returns no items but keeps the total
+        for offset in (27, 100):
+            self.assertEqual(self.app.search_tickets("bulk", offset=offset),
+                             {"total": 27, "items": []})
+
+    def test_search_tickets_no_match_and_empty_directory_create_nothing(self):
+        self.assertEqual(self.app.search_tickets("anything"), {"total": 0, "items": []})
+        self.assertFalse(self.app.path.exists())
+        missing = self.root / "missing"
+        self.assertEqual(SupportDesk(missing).search_tickets("anything"), {"total": 0, "items": []})
+        self.assertFalse(missing.exists())
+        self.app.open_ticket("T", "Alice", "Download")
+        self.assertEqual(self.app.search_tickets("nothing matches"), {"total": 0, "items": []})
+
+    def test_search_tickets_legacy_tickets_missing_fields_are_not_backfilled(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        doc = {"tickets": {
+            "T-old": {"ticket_id": "T-old", "customer": "Alice", "subject": "老工单",
+                      "status": "open", "assignee": None, "notes": ["历史备注"], "resolution": None},
+            "T-null": {"ticket_id": "T-null", "customer": "Bob", "subject": "空响应工单",
+                       "status": "open", "assignee": None, "notes": [], "resolution": None,
+                       "opened_at": 5, "first_response": None},
+        }}
+        path = legacy / "data.json"
+        path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        app = SupportDesk(legacy)
+        # missing category/replies and a null first response are all queried as-is
+        self.assertEqual([t["ticket_id"] for t in app.search_tickets("历史备注")["items"]], ["T-old"])
+        self.assertEqual([t["ticket_id"] for t in app.search_tickets("空响应")["items"]], ["T-null"])
+        both = app.search_tickets("工单", category=None)
+        self.assertEqual([t["ticket_id"] for t in both["items"]], ["T-null", "T-old"])
+        self.assertEqual(both["total"], 2)
+        self.assertEqual(app.search_tickets("工单", category="anything"), {"total": 0, "items": []})
+        # reads never backfill the missing fields and never rewrite the file
+        before = path.read_bytes()
+        app.search_tickets("工单")
+        self.assertEqual(path.read_bytes(), before)
+        stored = json.loads(path.read_text(encoding="utf-8"))["tickets"]
+        self.assertNotIn("category", stored["T-old"])
+        self.assertNotIn("replies", stored["T-old"])
+        self.assertNotIn("first_response", stored["T-old"])
+        self.assertIsNone(stored["T-null"]["first_response"])
+        self.assertNotIn("replies", stored["T-null"])
+
+    def test_search_tickets_knowledge_reply_uses_saved_body_through_changes(self):
+        self.app.open_ticket("T-src", "Fay", "下载指引")
+        self.app.assign("T-src", "小林")
+        self.app.close("T-src", "使用离线安装包")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T-04", "Dan", "无法下载", opened_at=3)
+        self.app.respond_with_knowledge("T-04", "KB-1", 4)
+        self.app.reply_with_knowledge("T-04", "KB-1", 5)
+        # knowledge answers are searched by the saved message body
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("离线安装包")["items"]],
+                         ["T-04", "T-src"])
+        # revisions, restores and disabling never change saved answers or their search results
+        self.app.update_knowledge("KB-1", "全新标题", "全新正文")
+        self.assertEqual(self.app.search_tickets("全新标题"), {"total": 0, "items": []})
+        self.assertEqual(self.app.search_tickets("全新正文"), {"total": 0, "items": []})
+        self.app.restore_knowledge("KB-1", 1)
+        self.app.set_knowledge_enabled("KB-1", False)
+        self.assertEqual([t["ticket_id"] for t in self.app.search_tickets("离线安装包")["items"]],
+                         ["T-04", "T-src"])
+        self.assertEqual(self.app.search_tickets("KB-1"), {"total": 0, "items": []})
+
+    def test_search_tickets_rejects_bad_arguments_without_writing(self):
+        self._search_scenario()
+        before = self.app.path.read_bytes()
+        for query in [None, 1, 1.5, True, [], {}, " ", "", "  \t\n "]:
+            with self.assertRaises(ValueError, msg=query):
+                self.app.search_tickets(query)
+        for status in ["Open", "CLOSED", "all", "", 1, True, False, ["open"]]:
+            with self.assertRaises(ValueError, msg=status):
+                self.app.search_tickets("vpn", status=status)
+        for category in [1, 1.5, True, [], {}, " ", "", "\t"]:
+            with self.assertRaises(ValueError, msg=category):
+                self.app.search_tickets("vpn", category=category)
+        for offset in [True, False, 1.5, "0", None, -1, -100]:
+            with self.assertRaises(ValueError, msg=offset):
+                self.app.search_tickets("vpn", offset=offset)
+        for limit in [True, False, 0, -1, 101, 1.5, "20", None]:
+            with self.assertRaises(ValueError, msg=limit):
+                self.app.search_tickets("vpn", limit=limit)
+        with self.assertRaises(TypeError):
+            self.app.search_tickets()
+        with self.assertRaises(TypeError):
+            self.app.search_tickets("vpn", unknown=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_search_tickets_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.search_tickets(" ")
+        with self.assertRaises(ValueError):
+            app.search_tickets("ok", limit=0)
+        with self.assertRaises(TypeError):
+            app.search_tickets()
+        self.assertFalse(fresh.exists())
+
+    def test_search_tickets_read_only_recreation_and_other_entries_untouched(self):
+        self._search_scenario()
+        before = self.app.path.read_bytes()
+        result = self.app.search_tickets("vpn")
+        self.assertEqual(self.app.path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.app.search_tickets("vpn", limit=0)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # recreating SupportDesk in the same directory gives identical results
+        recreated = SupportDesk(self.root)
+        self.assertEqual(recreated.search_tickets("vpn"), result)
+        # existing tickets, queues, stats and knowledge entries keep their rules
+        self.assertEqual([t["ticket_id"] for t in recreated.list_tickets()],
+                         ["T-01", "T-02", "T-03", "T-04", "T-05", "T-src"])
+        self.assertEqual([i["ticket"]["ticket_id"] for i in recreated.priority_queue()],
+                         ["T-01", "T-02", "T-04", "T-05"])
+        stats = recreated.response_stats()
+        self.assertEqual((stats["timed"], stats["responded"], stats["untimed"]), (4, 2, 2))
+        self.assertEqual([e["article_id"] for e in recreated.search_knowledge()], ["KB-1"])
+
+    def test_cli_ticket_search(self):
+        self._search_scenario()
+
+        def run(body, name="query.json"):
+            payload = self.root / name
+            payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+            return subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                   str(self.root), "ticket-search", str(payload)],
+                                  text=True, capture_output=True)
+
+        result = run({"query": " vpn "})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([t["ticket_id"] for t in value["items"]], ["T-01", "T-05"])
+        self.assertEqual(value["total"], 2)
+        # explicit null category plus explicit status and pagination
+        result = run({"query": "下载", "status": "closed", "category": None,
+                      "offset": 0, "limit": 100})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([t["ticket_id"] for t in json.loads(result.stdout)["items"]], ["T-src"])
+        # an array runs independent queries and returns results in input order
+        result = run([{"query": "dns"},
+                      {"query": "下载", "status": "closed"},
+                      {"query": "nothing-here"}], "batch.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = json.loads(result.stdout)
+        self.assertEqual([[t["ticket_id"] for t in v["items"]] for v in values],
+                         [["T-01"], ["T-src"], []])
+        # failures exit 2 with empty stdout and an error JSON on stderr
+        for body in [{"query": " "}, {"query": "vpn", "limit": 0},
+                     {"query": "vpn", "offset": -1}, {"query": "vpn", "status": "all"},
+                     {"query": "vpn", "category": " "}, {"status": "open"},
+                     {"query": "vpn", "extra": 1}]:
+            failed = run(body, "bad.json")
+            self.assertEqual(failed.returncode, 2, body)
+            self.assertEqual(failed.stdout, "")
+            self.assertIn("error", json.loads(failed.stderr))
+        # a batch that fails midway prints no partial results
+        failed = run([{"query": "vpn"}, {"query": "vpn", "offset": -1}, {"query": "dns"}],
+                     "bad-batch.json")
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
+    def test_cli_ticket_search_empty_root_creates_nothing(self):
+        missing = self.root / "missing"
+        payload = self.root / "query.json"
+        payload.write_text(json.dumps({"query": "anything"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(missing),
+                                 "ticket-search", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"total": 0, "items": []})
+        self.assertFalse(missing.exists())
+
 if __name__ == "__main__":
     unittest.main()
