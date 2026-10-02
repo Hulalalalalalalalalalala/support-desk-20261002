@@ -2131,5 +2131,250 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(failed.stderr))
         self.assertFalse(missing.exists())
 
+    def _review_scenario(self):
+        self._closed_ticket("T-src", subject="Download", resolution="Sent link")
+        self._closed_ticket("T-src2", subject="Password", resolution="Reset it")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.publish_knowledge("KB-2", "T-src2")
+        # T-a: KB-1 first response and KB-1 replies at indexes 0 and 3; the manual
+        # reply and the KB-2 reply in between are not references to KB-1
+        self.app.open_ticket("T-a", "Alice", "Need help", opened_at=5)
+        self.app.respond_with_knowledge("T-a", "KB-1", 5)
+        self.app.reply_with_knowledge("T-a", "KB-1", 6)
+        self.app.reply("T-a", "manual note", 7)
+        self.app.reply_with_knowledge("T-a", "KB-2", 8)
+        self.app.reply_with_knowledge("T-a", "KB-1", 9)
+        # T-A: manual first response plus one KB-1 reply
+        self.app.open_ticket("T-A", "Ann", "Case", opened_at=5)
+        self.app.respond("T-A", "Hi", 6)
+        self.app.reply_with_knowledge("T-A", "KB-1", 7)
+        # T-b: manual first response plus one KB-1 reply
+        self.app.open_ticket("T-b", "Bob", "Other", opened_at=4)
+        self.app.respond("T-b", "Hi", 5)
+        self.app.reply_with_knowledge("T-b", "KB-1", 6)
+        # T-c: closed ticket with a KB-1 first response; excluded while closed
+        self.app.open_ticket("T-c", "Cara", "Closed one", opened_at=3)
+        self.app.respond_with_knowledge("T-c", "KB-1", 4)
+        self.app.assign("T-c", "Eve")
+        self.app.close("T-c", "Done")
+        # every saved KB-1 snapshot is now older than the current content
+        self.app.update_knowledge("KB-1", "Download v2", "New link")
+
+    def test_knowledge_review_queue_lists_stale_references_in_order(self):
+        self._review_scenario()
+        queue = self.app.knowledge_review_queue("KB-1")
+        self.assertEqual(set(queue), {"total", "items"})
+        self.assertEqual(queue["total"], 3)
+        # case-sensitive ticket_id order: uppercase sorts before lowercase
+        self.assertEqual([item["ticket"]["ticket_id"] for item in queue["items"]],
+                         ["T-A", "T-a", "T-b"])
+        first, second, third = queue["items"]
+        self.assertEqual(set(first), {"ticket", "references"})
+        self.assertEqual(first["references"], [{"kind": "reply", "index": 0}])
+        self.assertEqual(second["references"], [{"kind": "first_response", "index": None},
+                                                {"kind": "reply", "index": 0},
+                                                {"kind": "reply", "index": 3}])
+        self.assertEqual(third["references"], [{"kind": "reply", "index": 0}])
+        self.assertEqual(second["ticket"], self.app.get("T-a"))
+        # a recreated desk returns the same queue
+        self.assertEqual(queue, SupportDesk(self.root).knowledge_review_queue("KB-1"))
+
+    def test_knowledge_review_queue_current_content_and_other_articles_are_not_stale(self):
+        self._closed_ticket("T-src", subject="Download", resolution="Sent link")
+        self._closed_ticket("T-src2", subject="Password", resolution="Reset it")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.publish_knowledge("KB-2", "T-src2")
+        self.app.open_ticket("T-1", "Alice", "Need help", opened_at=5)
+        self.app.respond_with_knowledge("T-1", "KB-1", 5)
+        self.app.reply_with_knowledge("T-1", "KB-1", 6)
+        self.app.reply_with_knowledge("T-1", "KB-2", 7)
+        self.assertEqual(self.app.knowledge_review_queue("KB-1"), {"total": 0, "items": []})
+        # a no-op update keeps every snapshot current
+        self.app.update_knowledge("KB-1", "Download", "Sent link")
+        self.assertEqual(self.app.knowledge_review_queue("KB-1"), {"total": 0, "items": []})
+        # changing KB-2 does not affect KB-1's queue; KB-2's queue lists only its own
+        self.app.update_knowledge("KB-2", "Password v2", "New reset")
+        self.assertEqual(self.app.knowledge_review_queue("KB-1"), {"total": 0, "items": []})
+        queue = self.app.knowledge_review_queue("KB-2")
+        self.assertEqual(queue["total"], 1)
+        self.assertEqual(queue["items"][0]["ticket"]["ticket_id"], "T-1")
+        self.assertEqual(queue["items"][0]["references"], [{"kind": "reply", "index": 1}])
+
+    def test_knowledge_review_queue_revision_and_enabled_state_do_not_matter(self):
+        self._review_scenario()
+        # a fresh reference to the current content is not stale
+        self.app.open_ticket("T-d", "Dan", "Fresh", opened_at=10)
+        self.app.respond_with_knowledge("T-d", "KB-1", 10)
+        # an explicit old revision whose content differs from the current one is stale
+        self.app.open_ticket("T-e", "Eve", "Old rev", opened_at=10)
+        self.app.respond_with_knowledge("T-e", "KB-1", 10, revision=1)
+        queue = self.app.knowledge_review_queue("KB-1")
+        ids = [item["ticket"]["ticket_id"] for item in queue["items"]]
+        self.assertEqual(queue["total"], 4)
+        self.assertNotIn("T-d", ids)
+        self.assertIn("T-e", ids)
+        # disabled articles are still queryable
+        self.app.set_knowledge_enabled("KB-1", False)
+        self.assertEqual(self.app.knowledge_review_queue("KB-1")["total"], 4)
+
+    def test_knowledge_review_queue_closed_reopen_and_restore_reevaluate(self):
+        self._review_scenario()
+        self.assertEqual(self.app.knowledge_review_queue("KB-1")["total"], 3)
+        # reopening the closed ticket re-evaluates it against the current content
+        self.app.reopen_ticket("T-c", "not fixed")
+        queue = self.app.knowledge_review_queue("KB-1")
+        self.assertEqual(queue["total"], 4)
+        self.assertEqual(queue["items"][-1]["ticket"]["ticket_id"], "T-c")
+        self.assertEqual(queue["items"][-1]["references"],
+                         [{"kind": "first_response", "index": None}])
+        # closing again excludes it
+        self.app.assign("T-c", "Eve")
+        self.app.close("T-c", "Done again")
+        self.assertEqual(self.app.knowledge_review_queue("KB-1")["total"], 3)
+        # restoring the original content makes every saved snapshot current again
+        self.app.restore_knowledge("KB-1", 1)
+        self.assertEqual(self.app.knowledge_review_queue("KB-1"), {"total": 0, "items": []})
+        # the stored snapshots themselves are never rewritten
+        ticket = self.app.get("T-a")
+        self.assertEqual(ticket["first_response"]["knowledge"]["content"], "Sent link")
+        self.assertEqual(ticket["replies"][0]["knowledge"]["title"], "Download")
+
+    def test_knowledge_review_queue_pagination(self):
+        self._review_scenario()
+        queue = self.app.knowledge_review_queue("KB-1", limit=2)
+        self.assertEqual(queue["total"], 3)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in queue["items"]], ["T-A", "T-a"])
+        queue = self.app.knowledge_review_queue("KB-1", offset=2, limit=2)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in queue["items"]], ["T-b"])
+        # offset at or beyond the total keeps the real total with an empty page
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", offset=3),
+                         {"total": 3, "items": []})
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", offset=10, limit=100),
+                         {"total": 3, "items": []})
+        # defaults are offset 0 and limit 20
+        self.assertEqual(len(self.app.knowledge_review_queue("KB-1")["items"]), 3)
+        # article_id is trimmed before the case-sensitive lookup
+        self.assertEqual(self.app.knowledge_review_queue(" KB-1 ")["total"], 3)
+
+    def test_knowledge_review_queue_legacy_records(self):
+        knowledge = {"article_id": "KB-1", "source_ticket_id": "T-src",
+                     "title": "Old title", "content": "Old content"}
+        base = {"customer": "Alice", "subject": "Old", "status": "open",
+                "assignee": None, "notes": [], "resolution": None, "opened_at": 1}
+        data = {
+            # a legacy article without stored history still compares against current content
+            "knowledge": {"KB-1": {"article_id": "KB-1", "source_ticket_id": "T-src",
+                                   "title": "New title", "content": "New content"}},
+            "tickets": {
+                "T-stale": {**base, "ticket_id": "T-stale",
+                            "first_response": {"message": "Old content", "responded_at": 2,
+                                               "knowledge": knowledge}},
+                "T-reply": {**base, "ticket_id": "T-reply", "first_response": {},
+                            "replies": [{"message": "Old content", "replied_at": 3,
+                                         "knowledge": knowledge}]},
+                "T-none": {**base, "ticket_id": "T-none"},
+                "T-null": {**base, "ticket_id": "T-null", "first_response": None},
+                "T-empty": {**base, "ticket_id": "T-empty", "first_response": {}},
+            },
+        }
+        self.app.path.write_text(json.dumps(data), encoding="utf-8")
+        queue = self.app.knowledge_review_queue("KB-1")
+        self.assertEqual(queue["total"], 2)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in queue["items"]],
+                         ["T-reply", "T-stale"])
+        self.assertEqual(queue["items"][0]["references"], [{"kind": "reply", "index": 0}])
+        self.assertEqual(queue["items"][1]["references"],
+                         [{"kind": "first_response", "index": None}])
+        # the query never backfills missing fields
+        stored = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertNotIn("first_response", stored["tickets"]["T-none"])
+        self.assertNotIn("replies", stored["tickets"]["T-null"])
+
+    def test_knowledge_review_queue_rejects_bad_arguments_without_writing(self):
+        self._review_scenario()
+        before = self.app.path.read_bytes()
+        for bad in (None, 1, 1.5, True, "", "  ", ["KB-1"]):
+            with self.assertRaises(ValueError):
+                self.app.knowledge_review_queue(bad)
+        # the lookup is case-sensitive and unknown articles are rejected
+        with self.assertRaises(ValueError):
+            self.app.knowledge_review_queue("kb-1")
+        with self.assertRaises(ValueError):
+            self.app.knowledge_review_queue("KB-X")
+        for bad in (-1, True, 1.5, "0", None):
+            with self.assertRaises(ValueError):
+                self.app.knowledge_review_queue("KB-1", offset=bad)
+        for bad in (0, 101, -1, True, 1.5, "20", None):
+            with self.assertRaises(ValueError):
+                self.app.knowledge_review_queue("KB-1", limit=bad)
+        with self.assertRaises(TypeError):
+            self.app.knowledge_review_queue()
+        with self.assertRaises(TypeError):
+            self.app.knowledge_review_queue("KB-1", unknown=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_knowledge_review_queue_is_read_only(self):
+        self._review_scenario()
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.knowledge_review_queue("KB-1")["total"], 3)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # no data means the article does not exist, and the failure creates nothing
+        missing = self.root / "missing"
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).knowledge_review_queue("KB-1")
+        self.assertFalse(missing.exists())
+
+    def test_cli_knowledge_review_queue(self):
+        self._review_scenario()
+        payload = self.root / "review.json"
+        payload.write_text(json.dumps({"article_id": "KB-1", "limit": 2}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "knowledge-review-queue", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["total"], 3)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in value["items"]], ["T-A", "T-a"])
+        self.assertEqual(value["items"][1]["references"],
+                         [{"kind": "first_response", "index": None},
+                          {"kind": "reply", "index": 0},
+                          {"kind": "reply", "index": 3}])
+        # array input preserves the input order
+        payload.write_text(json.dumps([{"article_id": "KB-1", "offset": 3},
+                                       {"article_id": "KB-2"}]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "knowledge-review-queue", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         [{"total": 3, "items": []}, {"total": 0, "items": []}])
+        # failures exit 2 with an error object on stderr and nothing on stdout
+        payload.write_text(json.dumps({"article_id": "KB-X"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "knowledge-review-queue", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        # a failure mid-array prints no partial results at all
+        payload.write_text(json.dumps([{"article_id": "KB-1"},
+                                       {"article_id": "KB-1", "limit": 0}]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "knowledge-review-queue", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        # a failure against a missing root creates neither directory nor file
+        missing = self.root / "missing"
+        payload.write_text(json.dumps({"article_id": "KB-1"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(missing), "knowledge-review-queue", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertFalse(missing.exists())
+
 if __name__ == "__main__":
     unittest.main()
