@@ -1104,5 +1104,382 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([h["content"] for h in SupportDesk(self.root).knowledge_history("KB-1")],
                          ["Sent link", "Second", "Sent link", "Second"])
 
+    def test_reply_appends_in_order_and_preserves_the_full_ticket(self):
+        self.app.open_ticket("T", "Alice", "Download", opened_at=5)
+        self.app.assign("T", "Bob")
+        self.app.note("T", "Checked")
+        self.app.set_category("T", "network")
+        self.app.set_priority("T", "high")
+        self.app.respond("T", "On it", 6)
+        # a ticket with a first response but no follow-ups has no replies field, and reads do not add one
+        self.assertNotIn("replies", self.app.get("T"))
+        first = self.app.reply(" T ", " 第一行\n第二行 保留。 ", 7)
+        self.assertEqual(first, self.app.get("T"))
+        self.assertEqual(first["replies"], [{"message": "第一行\n第二行 保留。", "replied_at": 7}])
+        # resubmitting the identical body and minute still appends another record
+        self.app.reply("T", "第一行\n第二行 保留。", 7)
+        ticket = self.app.reply("T", "later", 12)
+        self.assertEqual([(r["message"], r["replied_at"]) for r in ticket["replies"]],
+                         [("第一行\n第二行 保留。", 7), ("第一行\n第二行 保留。", 7), ("later", 12)])
+        for record in ticket["replies"]:
+            self.assertEqual(set(record), {"message", "replied_at"})
+        # first response, assignment, status, category, priority, notes and resolution stay unchanged
+        self.assertEqual(ticket["first_response"], {"message": "On it", "responded_at": 6})
+        self.assertEqual((ticket["status"], ticket["assignee"], ticket["category"],
+                          ticket["priority"], ticket["notes"], ticket["resolution"]),
+                         ("open", "Bob", "network", "high", ["Checked"], None))
+        reloaded = SupportDesk(self.root).get("T")
+        self.assertEqual(reloaded, ticket)
+
+    def test_reply_and_knowledge_reply_alternate_between_both_first_response_sources(self):
+        self._closed_ticket("T-src", subject="下载指引", resolution="引用正文")
+        snapshot = {"article_id": "KB-1", "source_ticket_id": "T-src",
+                    "title": "下载指引", "content": "引用正文"}
+        self.app.publish_knowledge("KB-1", "T-src")
+        # one ticket with a plain manual first response
+        self.app.open_ticket("T-manual", "Alice", "手动首答", opened_at=3)
+        self.app.assign("T-manual", "Bob")
+        self.app.note("T-manual", "已记录")
+        self.app.set_category("T-manual", "network")
+        self.app.set_priority("T-manual", "high")
+        self.app.respond("T-manual", "人工首答", 3)
+        # and one whose first response cites a knowledge article
+        self.app.open_ticket("T-knowledge", "Cara", "知识首答", opened_at=4)
+        self.app.respond_with_knowledge("T-knowledge", "KB-1", 4)
+        # alternate the two follow-up kinds, integer minutes, equal minutes allowed
+        manual3 = self.app.reply("T-manual", "后续一", 3)
+        self.assertEqual(manual3, self.app.get("T-manual"))
+        self.app.reply_with_knowledge("T-knowledge", "KB-1", 5)
+        self.app.reply_with_knowledge("T-manual", "KB-1", 5)
+        knowledge2 = self.app.reply("T-knowledge", "手写后续", 6)
+        manual_ticket = self.app.reply("T-manual", "后续一", 5)
+        self.assertEqual(knowledge2, self.app.get("T-knowledge"))
+        self.assertEqual(manual_ticket["replies"], [
+            {"message": "后续一", "replied_at": 3},
+            {"message": "引用正文", "replied_at": 5, "knowledge": dict(snapshot)},
+            {"message": "后续一", "replied_at": 5},
+        ])
+        self.assertEqual(self.app.get("T-knowledge")["replies"], [
+            {"message": "引用正文", "replied_at": 5, "knowledge": dict(snapshot)},
+            {"message": "手写后续", "replied_at": 6},
+        ])
+        self.assertEqual(self.app.get("T-knowledge")["replies"], [
+            {"message": "引用正文", "replied_at": 5, "knowledge": dict(snapshot)},
+            {"message": "手写后续", "replied_at": 6},
+        ])
+        # surrounding fields on both tickets stay as they were
+        self.assertEqual(manual_ticket["first_response"], {"message": "人工首答", "responded_at": 3})
+        self.assertEqual((manual_ticket["status"], manual_ticket["assignee"], manual_ticket["notes"],
+                          manual_ticket["category"], manual_ticket["priority"],
+                          manual_ticket["resolution"]),
+                         ("open", "Bob", ["已记录"], "network", "high", None))
+        knowledge_ticket = self.app.get("T-knowledge")
+        self.assertEqual(knowledge_ticket["first_response"]["responded_at"], 4)
+        self.assertEqual(knowledge_ticket["first_response"]["knowledge"], dict(snapshot))
+        self.assertIsNone(knowledge_ticket["assignee"])
+        # recreating SupportDesk reads back identical tickets in the same append order
+        reloaded = SupportDesk(self.root)
+        self.assertEqual(reloaded.get("T-manual"), manual_ticket)
+        self.assertEqual(reloaded.get("T-knowledge"), knowledge_ticket)
+
+    def test_reply_normalizes_identifiers_and_preserves_message_body(self):
+        self.app.open_ticket("T-Case", "Alice", "A", opened_at=1)
+        self.app.respond("T-Case", "hi", 2)
+        ticket = self.app.reply("  T-Case  ", "  正文 内含 空格\n换行与标点!? ", 3)
+        self.assertEqual(ticket["replies"][-1]["message"], "正文 内含 空格\n换行与标点!?")
+        # identifiers are matched case-sensitively after trimming
+        with self.assertRaises(ValueError):
+            self.app.reply("t-case", "wrong case", 4)
+        for ticket_id, message in [(None, "x"), (1, "x"), (True, "x"), (" ", "x"),
+                                   ("T-Case", None), ("T-Case", 1), ("T-Case", True),
+                                   ("T-Case", []), ("T-Case", {}),
+                                   ("T-Case", " "), ("T-Case", "  \n\t ")]:
+            with self.assertRaises(ValueError, msg=(ticket_id, message)):
+                self.app.reply(ticket_id, message, 4)
+
+    def test_reply_allows_equal_minutes_and_duplicates_but_rejects_time_regression(self):
+        self._closed_ticket("T-src", resolution="引用正文")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T", "Alice", "A", opened_at=5)
+        self.app.respond("T", "首答", 8)
+        # a reply at the same minute as the first response is allowed
+        self.app.reply("T", "同分钟", 8)
+        # the same minute and identical body appends another record
+        self.app.reply("T", "同分钟", 8)
+        self.app.reply_with_knowledge("T", "KB-1", 10)
+        self.assertEqual([r["replied_at"] for r in self.app.get("T")["replies"]], [8, 8, 10])
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reply("T", "早于首答", 7)
+        with self.assertRaises(ValueError):
+            self.app.reply("T", "早于最后答复", 9)
+        with self.assertRaises(ValueError):
+            self.app.reply_with_knowledge("T", "KB-1", 7)
+        with self.assertRaises(ValueError):
+            self.app.reply_with_knowledge("T", "KB-1", 9)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual([r["replied_at"] for r in self.app.get("T")["replies"]], [8, 8, 10])
+
+    def test_reply_with_knowledge_uses_current_content_and_keeps_snapshots(self):
+        self._closed_ticket("T-src", subject="下载指引", resolution="甲")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T", "Alice", "A", opened_at=5)
+        self.app.respond("T", "首答", 6)
+        snap1 = {"article_id": "KB-1", "source_ticket_id": "T-src", "title": "下载指引", "content": "甲"}
+        record1 = self.app.reply_with_knowledge("T", " KB-1 ", 7)["replies"][-1]
+        self.assertEqual(record1, {"message": "甲", "replied_at": 7, "knowledge": dict(snap1)})
+        # revising the article only affects later citations
+        self.app.update_knowledge("KB-1", "下载指引", "乙")
+        record2 = self.app.reply_with_knowledge("T", "KB-1", 8)["replies"][-1]
+        self.assertEqual(record2["knowledge"]["content"], "乙")
+        # restoring an old revision likewise only changes the current content used going forward
+        self.app.restore_knowledge("KB-1", 1)
+        record3 = self.app.reply_with_knowledge("T", "KB-1", 9)["replies"][-1]
+        self.assertEqual(record3["knowledge"]["content"], "甲")
+        # disabling blocks new citations and never rewrites saved replies
+        self.app.set_knowledge_enabled("KB-1", False)
+        with self.assertRaises(ValueError):
+            self.app.reply_with_knowledge("T", "KB-1", 10)
+        self.app.set_knowledge_enabled("KB-1", True)
+        self.app.reply_with_knowledge("T", "KB-1", 10)
+        replies = SupportDesk(self.root).get("T")["replies"]
+        self.assertEqual([r["message"] for r in replies], ["甲", "乙", "甲", "甲"])
+        self.assertEqual([r["knowledge"]["content"] for r in replies], ["甲", "乙", "甲", "甲"])
+        for record in replies:
+            self.assertEqual(set(record), {"message", "replied_at", "knowledge"})
+            self.assertEqual(set(record["knowledge"]),
+                             {"article_id", "source_ticket_id", "title", "content"})
+        # the first response record and other ticket fields are never touched by follow-ups
+        ticket = self.app.get("T")
+        self.assertEqual(ticket["first_response"], {"message": "首答", "responded_at": 6})
+        self.assertEqual((ticket["status"], ticket["assignee"], ticket["resolution"]),
+                         ("open", None, None))
+
+    def test_reply_with_knowledge_legacy_article_enabled_and_missing_replies_not_backfilled(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "data.json").write_text(json.dumps({
+            "tickets": {
+                "T-old": {"ticket_id": "T-old", "customer": "甲", "subject": "旧工单",
+                          "status": "open", "assignee": None, "notes": [], "resolution": None,
+                          "opened_at": 5,
+                          "first_response": {"message": "首答", "responded_at": 6}},
+            },
+            "knowledge": {
+                "OLD": {"article_id": "OLD", "source_ticket_id": "T0",
+                        "title": "旧条目", "content": "旧正文"},
+            },
+        }, ensure_ascii=False), encoding="utf-8")
+        app = SupportDesk(legacy)
+        # reads of an old ticket without replies must not backfill the field
+        self.assertNotIn("replies", app.get("T-old"))
+        stored = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("replies", stored["tickets"]["T-old"])
+        self.assertNotIn("knowledge_enabled", stored)
+        # an article without any enable/disable record is treated as enabled
+        ticket = app.reply_with_knowledge("T-old", " OLD ", 7)
+        self.assertEqual(ticket["replies"], [{
+            "message": "旧正文", "replied_at": 7,
+            "knowledge": {"article_id": "OLD", "source_ticket_id": "T0",
+                          "title": "旧条目", "content": "旧正文"},
+        }])
+        # the field is added to storage only by the first successful append
+        stored = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertIn("replies", stored["tickets"]["T-old"])
+
+    def test_reply_blocked_after_close_and_reopen_keeps_history_and_time_order(self):
+        self._closed_ticket("T-src", resolution="引用正文")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T", "Alice", "A", opened_at=5)
+        self.app.assign("T", "Bob")
+        self.app.note("T", "Checked")
+        self.app.respond("T", "首答", 6)
+        self.app.reply("T", "后续", 7)
+        self.app.reply_with_knowledge("T", "KB-1", 8)
+        self.app.close("T", "已解决")
+        with self.assertRaises(ValueError):
+            self.app.reply("T", "closed", 9)
+        with self.assertRaises(ValueError):
+            self.app.reply_with_knowledge("T", "KB-1", 9)
+        ticket = self.app.reopen_ticket("T", "再次出现")
+        self.assertEqual(ticket["status"], "open")
+        self.assertIsNone(ticket["resolution"])
+        self.assertEqual([r["replied_at"] for r in ticket["replies"]], [7, 8])
+        # after reopening the original time order still applies
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reply("T", "早于首答", 5)
+        with self.assertRaises(ValueError):
+            self.app.reply("T", "早于最后答复", 7)
+        with self.assertRaises(ValueError):
+            self.app.reply_with_knowledge("T", "KB-1", 7)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # the same minute as the last reply is still allowed
+        reopened_reply = self.app.reply("T", "重开后续", 8)
+        self.assertEqual([r["replied_at"] for r in reopened_reply["replies"]], [7, 8, 8])
+        self.assertEqual(reopened_reply["first_response"], {"message": "首答", "responded_at": 6})
+        self.assertEqual((reopened_reply["assignee"], reopened_reply["notes"]), ("Bob", ["Checked"]))
+        self.app.close("T", "二次解决")
+        with self.assertRaises(ValueError):
+            self.app.reply("T", "blocked again", 9)
+        reloaded = SupportDesk(self.root).get("T")
+        self.assertEqual([r["replied_at"] for r in reloaded["replies"]], [7, 8, 8])
+        self.assertEqual(reloaded["status"], "closed")
+
+    def test_reply_allowed_for_unassigned_ticket(self):
+        self._closed_ticket("T-src", resolution="引用正文")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T", "Alice", "A", opened_at=5)
+        self.app.respond("T", "首答", 6)
+        ticket = self.app.reply("T", "手写后续", 6)
+        self.assertIsNone(ticket["assignee"])
+        ticket = self.app.reply_with_knowledge("T", "KB-1", 7)
+        self.assertIsNone(ticket["assignee"])
+        self.assertEqual([r["replied_at"] for r in ticket["replies"]], [6, 7])
+
+    def test_reply_rejects_bad_input_without_writing(self):
+        self._closed_ticket("T-src", resolution="引用正文")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T", "Alice", "A", opened_at=5)
+        self.app.respond("T", "首答", 6)
+        self.app.reply("T", "已有后续", 8)
+        self.app.open_ticket("T-untimed", "Bob", "无登记时间")
+        self.app.open_ticket("T-pending", "Cara", "尚无首答", opened_at=5)
+        self._closed_ticket("T-closed")
+        before = self.app.path.read_bytes()
+        # ticket preconditions: missing, closed, no opened_at, no first response
+        for ticket_id, message, replied_at in [
+            ("missing", "x", 9), ("T-closed", "x", 9),
+            ("T-untimed", "x", 9), ("T-pending", "x", 9),
+        ]:
+            with self.assertRaises(ValueError, msg=(ticket_id, message, replied_at)):
+                self.app.reply(ticket_id, message, replied_at)
+        # identifier and body must be nonempty strings after trimming
+        for ticket_id, message in [
+            (None, "x"), (1, "x"), (True, "x"), (" ", "x"),
+            ("T", None), ("T", 1), ("T", True), ("T", []), ("T", {}),
+            ("T", " "), ("T", "  \n\t "),
+        ]:
+            with self.assertRaises(ValueError, msg=(ticket_id, message)):
+                self.app.reply(ticket_id, message, 9)
+        # minute values reject negatives, booleans, floats, strings and null
+        for replied_at in [-1, True, False, 1.5, 9.0, "9", None]:
+            with self.assertRaises(ValueError, msg=replied_at):
+                self.app.reply("T", "x", replied_at)
+        # knowledge reply preconditions, identifiers, article state and minute types
+        for ticket_id, article_id, replied_at in [
+            ("missing", "KB-1", 9), ("T-closed", "KB-1", 9),
+            ("T-untimed", "KB-1", 9), ("T-pending", "KB-1", 9),
+            ("T", "kb-1", 9), ("T", "KB-X", 9),
+            (None, "KB-1", 9), (1, "KB-1", 9), (" ", "KB-1", 9),
+            ("T", None, 9), ("T", 1, 9), ("T", " ", 9),
+            ("T", "KB-1", -1), ("T", "KB-1", True), ("T", "KB-1", False),
+            ("T", "KB-1", 1.5), ("T", "KB-1", 9.0), ("T", "KB-1", "9"),
+            ("T", "KB-1", None),
+            ("T", "KB-1", 5),   # earlier than the first response
+            ("T", "KB-1", 7),   # earlier than the last reply
+        ]:
+            with self.assertRaises(ValueError, msg=(ticket_id, article_id, replied_at)):
+                self.app.reply_with_knowledge(ticket_id, article_id, replied_at)
+        # disabled articles cannot be cited by a new follow-up
+        self.app.set_knowledge_enabled("KB-1", False)
+        disabled_before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.reply_with_knowledge("T", "KB-1", 9)
+        self.assertEqual(disabled_before, self.app.path.read_bytes())
+        self.app.set_knowledge_enabled("KB-1", True)
+        # signature problems are TypeErrors and never write
+        stable_before = self.app.path.read_bytes()
+        with self.assertRaises(TypeError):
+            self.app.reply("T", "x")
+        with self.assertRaises(TypeError):
+            self.app.reply("T")
+        with self.assertRaises(TypeError):
+            self.app.reply("T", "x", 9, extra=1)
+        with self.assertRaises(TypeError):
+            self.app.reply_with_knowledge("T", "KB-1")
+        with self.assertRaises(TypeError):
+            self.app.reply_with_knowledge("T")
+        with self.assertRaises(TypeError):
+            self.app.reply_with_knowledge("T", "KB-1", 9, extra=1)
+        # every rejected attempt leaves the file bytes and the saved replies untouched
+        self.assertEqual(stable_before, self.app.path.read_bytes())
+        self.assertEqual([r["replied_at"] for r in self.app.get("T")["replies"]], [8])
+
+    def test_reply_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.reply("T", "x", 5)
+        with self.assertRaises(ValueError):
+            app.reply_with_knowledge("T", "KB-1", 5)
+        self.assertFalse(fresh.exists())
+
+    def test_cli_reply_and_knowledge_reply(self):
+        self._closed_ticket("T-src", subject="下载指引", resolution="甲")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T", "Alice", "A", opened_at=5)
+        self.app.respond("T", "首答", 6)
+        self.app.open_ticket("T-k", "Bob", "B", opened_at=5)
+        self.app.respond_with_knowledge("T-k", "KB-1", 6)
+        payload = self.root / "reply.json"
+        payload.write_text(json.dumps({"ticket_id": " T ", "message": " 正文内含 空格\n换行。 ",
+                                      "replied_at": 7}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "reply", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["replies"][-1],
+                         {"message": "正文内含 空格\n换行。", "replied_at": 7})
+        knowledge_payload = self.root / "knowledge_reply.json"
+        knowledge_payload.write_text(json.dumps({"ticket_id": "T-k", "article_id": "KB-1",
+                                                 "replied_at": 7}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-reply", str(knowledge_payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["replies"][-1], {
+            "message": "甲", "replied_at": 7,
+            "knowledge": {"article_id": "KB-1", "source_ticket_id": "T-src",
+                          "title": "下载指引", "content": "甲"}})
+        # a successful batch prints a JSON array of full tickets
+        batch_ok = self.root / "batch_ok.json"
+        batch_ok.write_text(json.dumps([
+            {"ticket_id": "T", "message": "批处理一", "replied_at": 8},
+            {"ticket_id": "T", "message": "批处理二", "replied_at": 8},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "reply", str(batch_ok)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([ticket["replies"][-1]["message"] for ticket in json.loads(result.stdout)],
+                         ["批处理一", "批处理二"])
+        # a single failure exits 2 with empty stdout and an error JSON on stderr
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"ticket_id": "T", "message": "倒退", "replied_at": 1}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "reply", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        # arrays stop at the first error: the earlier success stays, the failed and
+        # later rows leave no record and never execute
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"ticket_id": "T", "message": "批处理保留", "replied_at": 9},
+            {"ticket_id": "T", "message": "倒退失败", "replied_at": 2},
+            {"ticket_id": "T", "message": "不应执行", "replied_at": 10},
+        ]), encoding="utf-8")
+        failed_batch = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "reply", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed_batch.returncode, 2)
+        self.assertEqual(failed_batch.stdout, "")
+        self.assertIn("error", json.loads(failed_batch.stderr))
+        self.assertEqual([(r["message"], r["replied_at"]) for r in SupportDesk(self.root).get("T")["replies"]],
+                         [("正文内含 空格\n换行。", 7), ("批处理一", 8), ("批处理二", 8), ("批处理保留", 9)])
+        knowledge_batch = self.root / "knowledge_batch.json"
+        knowledge_batch.write_text(json.dumps([
+            {"ticket_id": "T-k", "article_id": "KB-1", "replied_at": 8},
+            {"ticket_id": "T-k", "article_id": "KB-X", "replied_at": 9},
+            {"ticket_id": "T-k", "article_id": "KB-1", "replied_at": 10},
+        ]), encoding="utf-8")
+        failed_knowledge = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-reply", str(knowledge_batch)], text=True, capture_output=True)
+        self.assertEqual(failed_knowledge.returncode, 2)
+        self.assertEqual(failed_knowledge.stdout, "")
+        self.assertIn("error", json.loads(failed_knowledge.stderr))
+        self.assertEqual([r["replied_at"] for r in SupportDesk(self.root).get("T-k")["replies"]], [7, 8])
+
 if __name__ == "__main__":
     unittest.main()
