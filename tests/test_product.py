@@ -103,6 +103,123 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stderr))
 
+    def _responded(self, ticket_id, at, priority=None):
+        self.app.open_ticket(ticket_id, "Alice", "A", opened_at=0)
+        self.app.respond(ticket_id, "hi", at)
+        if priority is not None:
+            self.app.set_priority(ticket_id, priority)
+
+    def test_follow_up_queue_last_answer_waiting_and_overdue_boundary(self):
+        self._responded("T-first-only", 10)
+        self.app.reply("T-first-only", "again", 70)
+        queue = self.app.follow_up_queue(130)
+        self.assertEqual(set(queue), {"as_of", "items"})
+        self.assertEqual(queue["as_of"], 130)
+        only = next(i for i in queue["items"] if i["ticket"]["ticket_id"] == "T-first-only")
+        self.assertEqual((only["last_answered_at"], only["waiting_minutes"], only["overdue"], only["priority"]),
+                         (70, 60, False, "normal"))
+        self.assertEqual(set(only), {"ticket", "priority", "last_answered_at", "waiting_minutes", "overdue"})
+        self.assertEqual(only["ticket"], self.app.get("T-first-only"))
+        self.assertTrue(next(i for i in self.app.follow_up_queue(131)["items"]
+                             if i["ticket"]["ticket_id"] == "T-first-only")["overdue"])
+
+    def test_follow_up_queue_uses_first_response_when_replies_missing_or_empty(self):
+        self._responded("T-no-replies", 20)
+        data = self.app._read()
+        data["tickets"]["T-no-replies"]["replies"] = []
+        self.app._write(data)
+        ticket = self.app.open_ticket("T-untimed", "Bob", "B")
+        data = self.app._read()
+        data["tickets"]["T-untimed"]["first_response"] = {"message": "m", "responded_at": 30}
+        self.app._write(data)
+        queue = self.app.follow_up_queue(100)
+        rows = {i["ticket"]["ticket_id"]: i for i in queue["items"]}
+        self.assertEqual(rows["T-no-replies"]["last_answered_at"], 20)
+        self.assertEqual(rows["T-untimed"]["last_answered_at"], 30)
+
+    def test_follow_up_queue_excludes_closed_null_empty_and_unresponded(self):
+        self._responded("T-closed", 5)
+        self.app.assign("T-closed", "Eve")
+        self.app.close("T-closed", "Done")
+        self.app.open_ticket("T-empty", "Bob", "B", opened_at=5)  # first_response forced to {}
+        data = self.app._read()
+        data["tickets"]["T-empty"]["first_response"] = {}
+        self.app._write(data)
+        self.app.open_ticket("T-null", "Bob", "B", opened_at=5)  # first_response stays null
+        self.app.open_ticket("T-pending", "Cara", "C", opened_at=5)
+        queue = self.app.follow_up_queue(10)
+        self.assertEqual(queue["items"], [])
+
+    def test_follow_up_queue_sorts_by_time_then_priority_then_id(self):
+        self._responded("T-low", 10, "low")
+        self._responded("T-high", 10, "high")
+        self._responded("T-urgent", 10, "urgent")
+        self._responded("T-normal-b", 10)
+        self._responded("T-normal-a", 10)
+        self._responded("T-early", 5)
+        queue = self.app.follow_up_queue(100)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in queue["items"]],
+                         ["T-early", "T-urgent", "T-high", "T-normal-a", "T-normal-b", "T-low"])
+
+    def test_follow_up_queue_rejects_future_response_or_reply(self):
+        self._responded("T-future-reply", 10)
+        self.app.reply("T-future-reply", "later", 200)
+        self._responded("T-ok", 10)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.follow_up_queue(130)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # excluded (closed) tickets with future response/reply records do not participate in the check
+        self.app.assign("T-future-reply", "Eve")
+        self.app.close("T-future-reply", "Done")
+        queue = self.app.follow_up_queue(130)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in queue["items"]], ["T-ok"])
+
+    def test_follow_up_queue_reopens_keep_history_and_refresh_on_reply(self):
+        self._responded("T", 10)
+        self.app.reply("T", "again", 70)
+        self.app.assign("T", "Eve")
+        self.app.close("T", "Done")
+        self.app.reopen_ticket("T", "back")
+        queue = self.app.follow_up_queue(130)
+        self.assertEqual(queue["items"][0]["last_answered_at"], 70)
+        self.app.reply("T", "new", 120)
+        self.assertEqual(self.app.follow_up_queue(130)["items"][0]["last_answered_at"], 120)
+
+    def test_follow_up_queue_bad_arguments_and_signature(self):
+        for as_of in (True, 1.5, "40", None, -1):
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.follow_up_queue(as_of)
+        for target in (0, -5, True, 60.0, "60", None):
+            with self.assertRaises(ValueError, msg=target):
+                self.app.follow_up_queue(40, target)
+        with self.assertRaises(TypeError):
+            self.app.follow_up_queue()
+        with self.assertRaises(TypeError):
+            self.app.follow_up_queue(40, bogus=1)
+
+    def test_follow_up_queue_empty_directory_creates_no_file(self):
+        queue = self.app.follow_up_queue(0)
+        self.assertEqual(queue, {"as_of": 0, "items": []})
+        self.assertFalse(self.app.path.exists())
+
+    def test_cli_follow_up_queue(self):
+        self._responded("T-1", 10)
+        self.app.reply("T-1", "again", 70)
+        payload = self.root / "query.json"
+        payload.write_text(json.dumps({"as_of": 130}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "follow-up-queue", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["as_of"], 130)
+        self.assertEqual([(i["ticket"]["ticket_id"], i["waiting_minutes"], i["overdue"]) for i in value["items"]],
+                         [("T-1", 60, False)])
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"as_of": -1}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "follow-up-queue", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+
     def _closed_ticket(self, ticket_id="T", subject="Download", resolution="Sent link"):
         self.app.open_ticket(ticket_id, "Alice", subject)
         self.app.assign(ticket_id, "Bob")

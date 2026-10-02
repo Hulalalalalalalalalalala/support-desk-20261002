@@ -228,6 +228,34 @@ class SupportDesk(JsonStore):
         items.sort(key=lambda item: (item["ticket"]["opened_at"], item["ticket"]["ticket_id"]))
         return {"untimed": untimed, "items": items}
 
+    def follow_up_queue(self, as_of, target_minutes=60):
+        as_of = minute(as_of, "as_of")
+        target_minutes = positive(target_minutes, "target_minutes")
+        entries = []
+        for ticket in self._read().get("tickets", {}).values():
+            if ticket["status"] != "open":
+                continue
+            response = ticket.get("first_response")
+            # Only a non-empty first-response object qualifies; missing, null or {} are excluded.
+            if not isinstance(response, dict) or not response:
+                continue
+            replies = ticket.get("replies")
+            if replies:
+                last_answered_at = replies[-1]["replied_at"]
+            else:
+                last_answered_at = response["responded_at"]
+            if response["responded_at"] > as_of or any(reply["replied_at"] > as_of for reply in replies or []):
+                raise ValueError("response time must not be later than as_of")
+            entries.append((ticket, ticket.get("priority", "normal"), last_answered_at))
+        items = []
+        for ticket, priority, last_answered_at in entries:
+            waiting = as_of - last_answered_at
+            items.append({"ticket": ticket, "priority": priority, "last_answered_at": last_answered_at,
+                          "waiting_minutes": waiting, "overdue": waiting > target_minutes})
+        items.sort(key=lambda item: (item["last_answered_at"], PRIORITY_RANK[item["priority"]],
+                                     item["ticket"]["ticket_id"]))
+        return {"as_of": as_of, "items": items}
+
     def response_target_report(self, as_of, targets=None):
         as_of = minute(as_of, "as_of")
         target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
