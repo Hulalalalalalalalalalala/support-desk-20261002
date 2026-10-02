@@ -108,6 +108,107 @@ class ProductTests(unittest.TestCase):
         self.app.assign(ticket_id, "Bob")
         self.app.close(ticket_id, resolution)
 
+    def test_set_priority_persists_and_returns_full_ticket(self):
+        self.app.open_ticket("T-1", "Alice", "A", opened_at=5)
+        self.app.assign("T-1", "Bob")
+        self.app.note("T-1", "Checking")
+        ticket = self.app.set_priority(" T-1 ", " urgent ")
+        self.assertEqual(ticket["ticket_id"], "T-1")
+        self.assertEqual(ticket["priority"], "urgent")
+        self.assertEqual((ticket["status"], ticket["assignee"], ticket["notes"]), ("open", "Bob", ["Checking"]))
+        reloaded = SupportDesk(self.root).get("T-1")
+        self.assertEqual(reloaded["priority"], "urgent")
+        self.assertEqual(SupportDesk(self.root).set_priority("T-1", "urgent")["priority"], "urgent")
+
+    def test_set_same_priority_changes_nothing_else(self):
+        self.app.open_ticket("T-1", "Alice", "A", opened_at=5)
+        self.app.respond("T-1", "On it", 6)
+        self.app.set_priority("T-1", "high")
+        before = self.app.get("T-1")
+        again = self.app.set_priority("T-1", "high")
+        self.assertEqual(again, before)
+        self.assertEqual(again["notes"], [])
+        self.assertEqual(again["status"], "open")
+        self.assertIsNone(again["assignee"])
+        self.assertIsNone(again["resolution"])
+        self.assertEqual(again["first_response"], {"message": "On it", "responded_at": 6})
+
+    def test_set_priority_rejects_bad_input_without_writing(self):
+        self.app.open_ticket("T-open", "Alice", "Open")
+        self._closed_ticket("T-closed")
+        before = self.app.path.read_bytes()
+        for ticket_id, priority in [(None, "high"), (1, "high"), (" ", "high"), ("T-open", None), ("T-open", 1),
+                                   ("T-open", True), ("T-open", " "), ("T-open", "HIGH"), ("T-open", "critical"),
+                                   ("missing", "high"), ("T-closed", "high")]:
+            with self.assertRaises(ValueError, msg=(ticket_id, priority)):
+                self.app.set_priority(ticket_id, priority)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_set_priority_empty_directory_creates_no_file(self):
+        with self.assertRaises(ValueError):
+            self.app.set_priority("T", "high")
+        self.assertFalse(self.app.path.exists())
+
+    def test_priority_queue_orders_and_keeps_tickets_raw(self):
+        self.app.open_ticket("T-low", "Alice", "A")
+        self.app.set_priority("T-low", "low")
+        self.app.open_ticket("T-default", "Bob", "B")
+        self.app.open_ticket("T-urgent", "Cara", "C", opened_at=5)
+        self.app.set_priority("T-urgent", "urgent")
+        self.app.respond("T-urgent", "On it", 6)
+        self.app.open_ticket("T-high-a", "Dan", "D")
+        self.app.set_priority("T-high-a", "high")
+        self.app.open_ticket("T-high-b", "Eve", "E")
+        self.app.set_priority("T-high-b", "high")
+        self.app.open_ticket("T-normal", "Fay", "F")
+        self.app.set_priority("T-normal", "normal")
+        self.app.open_ticket("T-closed", "Gus", "G")
+        self.app.assign("T-closed", "Hank")
+        self.app.close("T-closed", "Done")
+        queue = self.app.priority_queue()
+        self.assertEqual([(item["ticket"]["ticket_id"], item["priority"]) for item in queue],
+                         [("T-urgent", "urgent"), ("T-high-a", "high"), ("T-high-b", "high"),
+                          ("T-default", "normal"), ("T-normal", "normal"), ("T-low", "low")])
+        self.assertNotIn("priority", next(item["ticket"] for item in queue if item["ticket"]["ticket_id"] == "T-default"))
+        self.assertEqual(queue[0]["ticket"], self.app.get("T-urgent"))
+        self.assertEqual(SupportDesk(self.root).priority_queue(), queue)
+
+    def test_priority_queue_empty_or_only_closed(self):
+        self.assertEqual(self.app.priority_queue(), [])
+        self.assertFalse(self.app.path.exists())
+        self._closed_ticket("T-closed")
+        self.assertEqual(self.app.priority_queue(), [])
+        missing = self.root / "missing"
+        self.assertEqual(SupportDesk(missing).priority_queue(), [])
+        self.assertFalse(missing.exists())
+
+    def test_cli_priority_set_and_queue(self):
+        self.app.open_ticket("T-low", "Alice", "A")
+        self.app.open_ticket("T-urgent", "Bob", "B")
+        payload = self.root / "priorities.json"
+        payload.write_text(json.dumps([{"ticket_id": "T-urgent", "priority": "urgent"},
+                                       {"ticket_id": "missing", "priority": "high"},
+                                       {"ticket_id": "T-low", "priority": "low"}]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "priority-set", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("error", json.loads(result.stderr))
+        self.assertEqual(self.app.get("T-urgent")["priority"], "urgent")
+        self.assertNotIn("priority", self.app.get("T-low"))
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "priority-queue"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([(i["ticket"]["ticket_id"], i["priority"]) for i in json.loads(result.stdout)],
+                         [("T-urgent", "urgent"), ("T-low", "normal")])
+
+    def test_priority_features_preserve_other_data(self):
+        self._closed_ticket("T-1")
+        self.app.publish_knowledge("KB-1", "T-1")
+        self.app.open_ticket("T-2", "Alice", "Other", opened_at=5)
+        self.app.set_priority("T-2", "high")
+        self.app.set_priority("T-2", "normal")
+        self.assertEqual(self.app.list_tickets(), [self.app.get("T-1"), self.app.get("T-2")])
+        self.assertEqual([e["article_id"] for e in self.app.search_knowledge()], ["KB-1"])
+        self.assertEqual(self.app.response_stats()["pending"], 1)
+
     def test_publish_knowledge_persists_and_source_untouched(self):
         self._closed_ticket()
         entry = self.app.publish_knowledge(" KB-1 ", "T")
