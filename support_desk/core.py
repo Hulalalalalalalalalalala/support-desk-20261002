@@ -100,9 +100,31 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
-    def respond_with_knowledge(self, ticket_id, article_id, responded_at=None):
+    def _knowledge_snapshot(self, data, article_id, revision):
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        if not data.get("knowledge_enabled", {}).get(article_id, True):
+            raise ValueError("knowledge article is disabled")
+        if revision is None:
+            return dict(entry), None
+        history = data.get("knowledge_history", {}).get(article_id)
+        if history is None:
+            # Old articles without stored history only have their current content as revision 1.
+            source = {"revision": 1, "title": entry["title"], "content": entry["content"]} if revision == 1 else None
+        else:
+            source = next((item for item in history if item["revision"] == revision), None)
+        if source is None:
+            raise ValueError("unknown knowledge revision")
+        snapshot = {"article_id": entry["article_id"], "source_ticket_id": entry["source_ticket_id"],
+                    "title": source["title"], "content": source["content"]}
+        return snapshot, revision
+
+    def respond_with_knowledge(self, ticket_id, article_id, responded_at=None, revision=None):
         ticket_id, article_id = text(ticket_id, "ticket_id"), text(article_id, "article_id")
         responded_at = minute(responded_at, "responded_at")
+        if revision is not None:
+            revision = positive(revision, "revision")
         data = self._read()
         ticket = data.get("tickets", {}).get(ticket_id)
         if ticket is None or ticket["status"] == "closed":
@@ -111,18 +133,17 @@ class SupportDesk(JsonStore):
             raise ValueError("ticket has no opened_at")
         if ticket.get("first_response") is not None:
             raise ValueError("ticket already has a first response")
-        entry = data.get("knowledge", {}).get(article_id)
-        if entry is None:
-            raise ValueError("unknown knowledge article")
-        if not data.get("knowledge_enabled", {}).get(article_id, True):
-            raise ValueError("knowledge article is disabled")
+        snapshot, knowledge_revision = self._knowledge_snapshot(data, article_id, revision)
         if responded_at < ticket["opened_at"]:
             raise ValueError("responded_at must not be earlier than opened_at")
-        ticket["first_response"] = {
-            "message": entry["content"],
+        first_response = {
+            "message": snapshot["content"],
             "responded_at": responded_at,
-            "knowledge": dict(entry),
+            "knowledge": snapshot,
         }
+        if knowledge_revision is not None:
+            first_response["knowledge_revision"] = knowledge_revision
+        ticket["first_response"] = first_response
         self._write(data)
         return ticket
 
@@ -153,22 +174,23 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
-    def reply_with_knowledge(self, ticket_id, article_id, replied_at):
+    def reply_with_knowledge(self, ticket_id, article_id, replied_at, revision=None):
         ticket_id, article_id = text(ticket_id, "ticket_id"), text(article_id, "article_id")
         replied_at = minute(replied_at, "replied_at")
+        if revision is not None:
+            revision = positive(revision, "revision")
         data = self._read()
         ticket = self._reply_target(data, ticket_id)
-        entry = data.get("knowledge", {}).get(article_id)
-        if entry is None:
-            raise ValueError("unknown knowledge article")
-        if not data.get("knowledge_enabled", {}).get(article_id, True):
-            raise ValueError("knowledge article is disabled")
+        snapshot, knowledge_revision = self._knowledge_snapshot(data, article_id, revision)
         self._check_reply_time(ticket, replied_at)
-        ticket.setdefault("replies", []).append({
-            "message": entry["content"],
+        reply = {
+            "message": snapshot["content"],
             "replied_at": replied_at,
-            "knowledge": dict(entry),
-        })
+            "knowledge": snapshot,
+        }
+        if knowledge_revision is not None:
+            reply["knowledge_revision"] = knowledge_revision
+        ticket.setdefault("replies", []).append(reply)
         self._write(data)
         return ticket
 
