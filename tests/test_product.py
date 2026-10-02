@@ -2850,5 +2850,248 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(SupportDesk(self.root).get("T-1")["assignee"], "R")
         self.assertEqual(SupportDesk(self.root).get("T-2")["assignee"], "X")
 
+    def _received_ticket(self, ticket_id, opened_at=0):
+        self.app.open_ticket(ticket_id, "Alice", "A", opened_at=opened_at)
+        return ticket_id
+
+    def test_receive_persists_trims_ends_keeps_internal_text_and_appends_duplicates(self):
+        self._received_ticket("T", 5)
+        ticket = self.app.receive(" T ", "  还没好\n请尽快处理!  ", 10)
+        self.assertEqual(ticket["customer_messages"],
+                         [{"message": "还没好\n请尽快处理!", "received_at": 10}])
+        self.assertEqual(set(ticket["customer_messages"][0]), {"message", "received_at"})
+        self.assertEqual(ticket, self.app.get("T"))
+        self.app.receive("T", "还没好\n请尽快处理!", 10)
+        self.app.receive("T", "again", 10)
+        messages = SupportDesk(self.root).get("T")["customer_messages"]
+        self.assertEqual([(m["message"], m["received_at"]) for m in messages],
+                         [("还没好\n请尽快处理!", 10), ("还没好\n请尽快处理!", 10), ("again", 10)])
+
+    def test_receive_field_is_added_only_on_first_success(self):
+        self._received_ticket("T", 5)
+        self.assertNotIn("customer_messages", self.app.get("T"))
+        self.app.receive("T", "m", 6)
+        self.assertIn("customer_messages", self.app.get("T"))
+
+    def test_receive_allows_equal_minutes_but_rejects_regression(self):
+        self._received_ticket("T", 5)
+        self.app.receive("T", "at ten", 10)
+        self.app.receive("T", "same minute", 10)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.receive("T", "too early", 9)
+        with self.assertRaises(ValueError):
+            self.app.receive("T", "before opened_at", 4)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual([m["received_at"] for m in self.app.get("T")["customer_messages"]], [10, 10])
+
+    def test_receive_requires_open_ticket_with_opened_at_assignment_independent(self):
+        self._received_ticket("T-open", 5)
+        self.app.open_ticket("T-untimed", "Bob", "B")
+        self.app.open_ticket("T-closed", "Cara", "C", opened_at=5)
+        self.app.assign("T-closed", "Eve")
+        self.app.respond("T-closed", "Seen", 6)
+        self.app.close("T-closed", "Done")
+        # an unassigned, unresponded open ticket still receives follow-ups
+        ticket = self.app.receive("T-open", "m", 6)
+        self.assertIsNone(ticket["assignee"])
+        for ticket_id in ("missing", "T-untimed", "T-closed"):
+            with self.assertRaises(ValueError, msg=ticket_id):
+                self.app.receive(ticket_id, "m", 6)
+        with self.assertRaises(ValueError):
+            self.app.receive("t-open", "m", 6)
+
+    def test_receive_rejects_bad_input_without_writing(self):
+        self._received_ticket("T", 5)
+        before = self.app.path.read_bytes()
+        for ticket_id, message, received_at in [
+            (None, "m", 6), (1, "m", 6), (" ", "m", 6),
+            ("T", None, 6), ("T", 1, 6), ("T", " ", 6),
+            ("T", "m", -1), ("T", "m", True), ("T", "m", 1.5),
+            ("T", "m", "6"), ("T", "m", None),
+        ]:
+            with self.assertRaises(ValueError, msg=(ticket_id, message, received_at)):
+                self.app.receive(ticket_id, message, received_at)
+        with self.assertRaises(TypeError):
+            self.app.receive("T", "m")
+        with self.assertRaises(TypeError):
+            self.app.receive("T")
+        with self.assertRaises(TypeError):
+            self.app.receive("T", "m", 6, "extra")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertNotIn("customer_messages", self.app.get("T"))
+
+    def test_receive_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.receive("T", "m", 6)
+        self.assertFalse(fresh.exists())
+
+    def test_customer_queue_counts_waiting_and_overdue_boundary(self):
+        self._received_ticket("T", 0)
+        self.app.respond("T", "answer", 10)
+        # follow-up at 30 stays unanswered; 30-minute wait against target 30 is not overdue
+        self.app.receive("T", "later", 30)
+        queue = self.app.customer_queue(60)
+        self.assertEqual(len(queue), 1)
+        row = queue[0]
+        self.assertEqual(set(row), {"ticket", "count", "waiting_minutes", "overdue"})
+        self.assertEqual((row["count"], row["waiting_minutes"], row["overdue"]), (1, 30, False))
+        self.assertEqual(row["ticket"], self.app.get("T"))
+        self.assertTrue(self.app.customer_queue(61)[0]["overdue"])
+
+    def test_customer_queue_boundary_is_latest_answer_and_same_minute_is_covered(self):
+        self._received_ticket("T", 0)
+        self.app.respond("T", "first", 10)
+        # earlier than or equal to the first answer: covered
+        self.app.receive("T", "q-before", 5)
+        self.app.receive("T", "q-same", 10)
+        self.app.reply("T", "second", 20)
+        # strictly later than the latest answer: unanswered; q@20 is covered, q@21 is not
+        self.app.receive("T", "q-reply-same", 20)
+        self.app.receive("T", "q-unanswered", 21)
+        self.app.receive("T", "q-last", 40)
+        queue = self.app.customer_queue(50)
+        row = next(i for i in queue if i["ticket"]["ticket_id"] == "T")
+        self.assertEqual(row["count"], 2)
+        self.assertEqual(row["waiting_minutes"], 29)
+
+    def test_customer_queue_without_any_answer_all_follow_ups_unanswered(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "one", 5)
+        self.app.receive("T", "two", 8)
+        row = next(i for i in self.app.customer_queue(40)
+                   if i["ticket"]["ticket_id"] == "T")
+        self.assertEqual((row["count"], row["waiting_minutes"]), (2, 35))
+
+    def test_customer_queue_excludes_closed_answered_and_historyless(self):
+        self._received_ticket("T-closed", 0)
+        self.app.receive("T-closed", "q", 5)
+        self.app.assign("T-closed", "Eve")
+        self.app.close("T-closed", "Done")
+        self._received_ticket("T-answered", 0)
+        self.app.respond("T-answered", "r", 10)
+        self.app.receive("T-answered", "q", 10)
+        self._received_ticket("T-no-history", 0)
+        self.app.respond("T-no-history", "r", 5)
+        self._received_ticket("T-empty", 0)
+        data = self.app._read()
+        data["tickets"]["T-empty"]["first_response"] = {}
+        self.app._write(data)
+        self.assertEqual(self.app.customer_queue(20), [])
+        # null / empty first response still means "no answer": follow-ups there are pending
+        self.app.receive("T-empty", "q", 10)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in self.app.customer_queue(20)], ["T-empty"])
+
+    def test_customer_queue_sorts_by_earliest_unanswered_then_ticket_id(self):
+        self._received_ticket("T-b", 0)
+        self.app.receive("T-b", "q", 10)
+        self._received_ticket("T-a", 0)
+        self.app.receive("T-a", "q", 10)
+        self._received_ticket("T-early", 0)
+        self.app.receive("T-early", "q", 5)
+        queue = self.app.customer_queue(40)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in queue], ["T-early", "T-a", "T-b"])
+
+    def test_customer_queue_raises_if_any_follow_up_or_answer_is_later_than_as_of(self):
+        self._received_ticket("T-msg", 0)
+        self.app.respond("T-msg", "r", 5)
+        self.app.receive("T-msg", "q", 40)
+        self._received_ticket("T-ans", 0)
+        self.app.receive("T-ans", "q", 5)
+        self.app.respond("T-ans", "r", 40)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.customer_queue(30)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # a closed ticket with future records does not participate in the check
+        self.app.assign("T-msg", "Eve")
+        self.app.close("T-msg", "Done")
+        with self.assertRaises(ValueError):
+            self.app.customer_queue(30)
+        self.app.assign("T-ans", "Fay")
+        self.app.close("T-ans", "Done")
+        self.assertEqual(self.app.customer_queue(30), [])
+
+    def test_customer_queue_close_reopen_keeps_history_and_re_judges(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q", 5)
+        self.assertEqual(len(self.app.customer_queue(10)), 1)
+        self.app.assign("T", "Eve")
+        self.app.close("T", "Done")
+        self.assertEqual(self.app.customer_queue(10), [])
+        self.app.reopen_ticket("T", "back")
+        row = self.app.customer_queue(10)[0]
+        self.assertEqual(row["ticket"]["ticket_id"], "T")
+        self.assertEqual(row["ticket"]["customer_messages"], [{"message": "q", "received_at": 5}])
+        # a new answer covering the outstanding follow-up removes it from the queue
+        self.app.respond("T", "answer", 10)
+        self.assertEqual(self.app.customer_queue(10), [])
+
+    def test_customer_queue_bad_arguments_and_empty_directory(self):
+        for as_of in (True, 1.5, "40", None, -1):
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.customer_queue(as_of)
+        for target in (0, -5, True, 30.0, "30", None):
+            with self.assertRaises(ValueError, msg=target):
+                self.app.customer_queue(40, target)
+        with self.assertRaises(TypeError):
+            self.app.customer_queue()
+        with self.assertRaises(TypeError):
+            self.app.customer_queue(40, bogus=1)
+        self.assertEqual(self.app.customer_queue(0), [])
+        self.assertFalse(self.app.path.exists())
+        missing = self.root / "missing"
+        self.assertEqual(SupportDesk(missing).customer_queue(0), [])
+        self.assertFalse(missing.exists())
+
+    def test_customer_queue_does_not_affect_notes_search_or_stats(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "uniquefollowupword", 5)
+        # follow-ups are not notes and do not appear in ticket search or response stats
+        self.assertEqual(self.app.get("T")["notes"], [])
+        self.assertEqual(self.app.search_tickets("uniquefollowupword")["items"], [])
+        self.assertEqual(self.app.response_stats()["responded"], 0)
+        before = self.app.path.read_bytes()
+        self.app.customer_queue(10)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_cli_receive_and_customer_queue(self):
+        self._received_ticket("T-1", 0)
+        self.app.respond("T-1", "answer", 10)
+        payload = self.root / "receive.json"
+        payload.write_text(json.dumps([
+            {"ticket_id": " T-1 ", "message": "  CLI question\nline two. ", "received_at": 30},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "receive", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ticket = json.loads(result.stdout)[0]
+        self.assertEqual(ticket["customer_messages"],
+                         [{"message": "CLI question\nline two.", "received_at": 30}])
+        query = self.root / "queue.json"
+        query.write_text(json.dumps({"as_of": 60}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "customer-queue", str(query)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([(i["ticket"]["ticket_id"], i["count"], i["waiting_minutes"], i["overdue"])
+                          for i in value], [("T-1", 1, 30, False)])
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"as_of": -1}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "customer-queue", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        bad_receive = self.root / "bad-receive.json"
+        bad_receive.write_text(json.dumps({"ticket_id": "missing", "message": "m",
+                                           "received_at": 1}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "receive", str(bad_receive)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+
 if __name__ == "__main__":
     unittest.main()
