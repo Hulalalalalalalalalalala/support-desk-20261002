@@ -2131,5 +2131,121 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(failed.stderr))
         self.assertFalse(missing.exists())
 
+    def _review_scenario(self):
+        self.app.open_ticket("T-src", "Alice", "How to reset", opened_at=1)
+        self.app.assign("T-src", "Bob")
+        self.app.close("T-src", "Use the reset link")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T-1", "Cara", "Q1", opened_at=2)
+        self.app.respond_with_knowledge("T-1", "KB-1", 3)
+        self.app.open_ticket("T-2", "Dan", "Q2", opened_at=2)
+        self.app.respond_with_knowledge("T-2", "KB-1", 3)
+        self.app.reply_with_knowledge("T-2", "KB-1", 4)
+        self.app.reply("T-2", "handwritten follow-up", 5)
+        self.app.open_ticket("T-3", "Eve", "Q3", opened_at=2)
+
+    def test_knowledge_review_queue_stale_references(self):
+        self._review_scenario()
+        self.assertEqual(self.app.knowledge_review_queue("KB-1"), {"total": 0, "items": []})
+        self.app.update_knowledge("KB-1", "How to reset", "Use the new reset portal")
+        queue = self.app.knowledge_review_queue("KB-1")
+        self.assertEqual(queue["total"], 2)
+        self.assertEqual([item["ticket"]["ticket_id"] for item in queue["items"]], ["T-1", "T-2"])
+        self.assertEqual(queue["items"][0]["references"], [{"kind": "first_response", "index": None}])
+        self.assertEqual(queue["items"][1]["references"],
+                         [{"kind": "first_response", "index": None}, {"kind": "reply", "index": 0}])
+        self.assertEqual(queue["items"][0]["ticket"], self.app.get("T-1"))
+        # restoring the matching content makes the saved snapshots current again
+        self.app.restore_knowledge("KB-1", 1)
+        self.assertEqual(self.app.knowledge_review_queue("KB-1"), {"total": 0, "items": []})
+
+    def test_knowledge_review_queue_status_and_enabled(self):
+        self._review_scenario()
+        self.app.update_knowledge("KB-1", "How to reset", "Use the new reset portal")
+        self.app.assign("T-1", "Bob")
+        self.app.close("T-1", "Done")
+        queue = self.app.knowledge_review_queue("KB-1")
+        self.assertEqual([item["ticket"]["ticket_id"] for item in queue["items"]], ["T-2"])
+        self.app.reopen_ticket("T-1", "customer replied")
+        self.assertEqual(self.app.knowledge_review_queue("KB-1")["total"], 2)
+        self.app.set_knowledge_enabled("KB-1", False)
+        self.assertEqual(self.app.knowledge_review_queue("KB-1")["total"], 2)
+
+    def test_knowledge_review_queue_ignores_other_articles_and_empty_first_response(self):
+        self._review_scenario()
+        self.app.open_ticket("T-src2", "Frank", "Other topic")
+        self.app.assign("T-src2", "Bob")
+        self.app.close("T-src2", "Other resolution")
+        self.app.publish_knowledge("KB-2", "T-src2")
+        self.app.reply_with_knowledge("T-2", "KB-2", 6)
+        self.app.update_knowledge("KB-1", "How to reset", "Use the new reset portal")
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        data["tickets"]["T-3"]["first_response"] = {}
+        self.app.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        queue = self.app.knowledge_review_queue("KB-1")
+        self.assertEqual([item["ticket"]["ticket_id"] for item in queue["items"]], ["T-1", "T-2"])
+        self.assertEqual(queue["items"][1]["references"],
+                         [{"kind": "first_response", "index": None}, {"kind": "reply", "index": 0}])
+        self.assertEqual(self.app.knowledge_review_queue("KB-2"), {"total": 0, "items": []})
+
+    def test_knowledge_review_queue_pagination(self):
+        self._review_scenario()
+        for name in ("T-4", "T-5"):
+            self.app.open_ticket(name, "Gil", "Q", opened_at=2)
+            self.app.respond_with_knowledge(name, "KB-1", 3)
+        self.app.update_knowledge("KB-1", "How to reset", "Use the new reset portal")
+        page = self.app.knowledge_review_queue("KB-1", offset=1, limit=2)
+        self.assertEqual(page["total"], 4)
+        self.assertEqual([item["ticket"]["ticket_id"] for item in page["items"]], ["T-2", "T-4"])
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", offset=4), {"total": 4, "items": []})
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", offset=99), {"total": 4, "items": []})
+
+    def test_knowledge_review_queue_rejects_bad_arguments_without_writes(self):
+        self._review_scenario()
+        before = self.app.path.read_bytes()
+        for article_id in ("", "  ", 123, None, True):
+            with self.assertRaises(ValueError, msg=article_id):
+                self.app.knowledge_review_queue(article_id)
+        with self.assertRaises(ValueError):
+            self.app.knowledge_review_queue("kb-1")
+        with self.assertRaises(ValueError):
+            self.app.knowledge_review_queue("KB-9")
+        for offset, limit in [(-1, 20), (True, 20), (1.5, 20), ("1", 20), (None, 20),
+                              (0, 0), (0, 101), (0, -1), (0, True), (0, 1.5), (0, "1"), (0, None)]:
+            with self.assertRaises(ValueError, msg=(offset, limit)):
+                self.app.knowledge_review_queue("KB-1", offset=offset, limit=limit)
+        with self.assertRaises(TypeError):
+            self.app.knowledge_review_queue()
+        with self.assertRaises(TypeError):
+            self.app.knowledge_review_queue("KB-1", unknown=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_knowledge_review_queue_empty_directory_creates_no_file(self):
+        missing = self.root / "missing"
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).knowledge_review_queue("KB-1")
+        self.assertFalse(missing.exists())
+
+    def test_cli_knowledge_review_queue(self):
+        self._review_scenario()
+        self.app.update_knowledge("KB-1", "How to reset", "Use the new reset portal")
+        payload = self.root / "review.json"
+        payload.write_text(json.dumps({"article_id": "KB-1"}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "knowledge-review-queue", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["total"], 2)
+        self.assertEqual([item["ticket"]["ticket_id"] for item in value["items"]], ["T-1", "T-2"])
+        bad = self.root / "review-bad.json"
+        bad.write_text(json.dumps({"article_id": "KB-9"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "knowledge-review-queue", str(bad)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
 if __name__ == "__main__":
     unittest.main()

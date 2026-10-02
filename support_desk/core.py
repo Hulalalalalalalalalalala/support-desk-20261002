@@ -445,6 +445,43 @@ class SupportDesk(JsonStore):
             })
         return report
 
+    def knowledge_review_queue(self, article_id, offset=0, limit=20):
+        article_id = text(article_id, "article_id")
+        # bool is a subclass of int, so compare types explicitly; floats and strings are rejected too.
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        data = self._read()
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+
+        def is_stale(record):
+            knowledge = record.get("knowledge") if isinstance(record, dict) else None
+            if not isinstance(knowledge, dict) or knowledge.get("article_id") != article_id:
+                return False
+            # Only title and content decide staleness; revision, source id and
+            # enabled state never participate in the comparison.
+            return knowledge.get("title") != entry["title"] or knowledge.get("content") != entry["content"]
+
+        items = []
+        for ticket in data.get("tickets", {}).values():
+            if ticket.get("status") != "open":
+                continue
+            references = []
+            response = ticket.get("first_response")
+            # Missing, null or {} first responses carry no reference.
+            if isinstance(response, dict) and response and is_stale(response):
+                references.append({"kind": "first_response", "index": None})
+            for index, reply in enumerate(ticket.get("replies") or []):
+                if is_stale(reply):
+                    references.append({"kind": "reply", "index": index})
+            if references:
+                items.append({"ticket": ticket, "references": references})
+        items.sort(key=lambda item: item["ticket"]["ticket_id"])
+        return {"total": len(items), "items": items[offset:offset + limit]}
+
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")
