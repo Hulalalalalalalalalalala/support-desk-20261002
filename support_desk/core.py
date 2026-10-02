@@ -445,39 +445,91 @@ class SupportDesk(JsonStore):
             })
         return report
 
-    def knowledge_review_queue(self, article_id, offset=0, limit=20):
+    def _knowledge_references(self, ticket, article_id):
+        # All references to an article saved on a ticket, in queue order, as
+        # (descriptor, snapshot) pairs; manual replies and other articles are skipped.
+        references = []
+        response = ticket.get("first_response")
+        # Missing, null or empty first responses carry no reference.
+        if isinstance(response, dict):
+            knowledge = response.get("knowledge")
+            if knowledge is not None and knowledge["article_id"] == article_id:
+                references.append(({"kind": "first_response", "index": None}, knowledge))
+        for index, reply in enumerate(ticket.get("replies") or []):
+            knowledge = reply.get("knowledge")
+            if knowledge is not None and knowledge["article_id"] == article_id:
+                references.append(({"kind": "reply", "index": index}, knowledge))
+        return references
+
+    def _review_covers(self, confirmations, descriptor, entry):
+        # A reference is confirmed only by its latest confirmation, and only while
+        # the article content still matches the title/body saved with that confirmation.
+        for record in reversed(confirmations):
+            if record["kind"] == descriptor["kind"] and record["index"] == descriptor["index"]:
+                return record["title"] == entry["title"] and record["content"] == entry["content"]
+        return False
+
+    def knowledge_review_queue(self, article_id, offset=0, limit=20, pending_only=False):
         article_id = text(article_id, "article_id")
         # bool is a subclass of int, so compare types explicitly; floats and strings are rejected too.
         if type(offset) is not int or offset < 0:
             raise ValueError("offset must be a nonnegative integer")
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
+        if type(pending_only) is not bool:
+            raise ValueError("pending_only must be a boolean")
         data = self._read()
         entry = data.get("knowledge", {}).get(article_id)
         if entry is None:
             raise ValueError("unknown knowledge article")
-        def stale(snapshot):
-            # Only the saved title/content are compared; revision, source and enabled state are not.
-            return snapshot["title"] != entry["title"] or snapshot["content"] != entry["content"]
+        confirmations = data.get("knowledge_reviews", {}).get(article_id, {})
         matched = []
         for ticket in data.get("tickets", {}).values():
             if ticket["status"] != "open":
                 continue
             references = []
-            response = ticket.get("first_response")
-            # Missing, null or empty first responses carry no reference.
-            if isinstance(response, dict):
-                knowledge = response.get("knowledge")
-                if knowledge is not None and knowledge["article_id"] == article_id and stale(knowledge):
-                    references.append({"kind": "first_response", "index": None})
-            for index, reply in enumerate(ticket.get("replies") or []):
-                knowledge = reply.get("knowledge")
-                if knowledge is not None and knowledge["article_id"] == article_id and stale(knowledge):
-                    references.append({"kind": "reply", "index": index})
+            confirmed = confirmations.get(ticket["ticket_id"], [])
+            for descriptor, snapshot in self._knowledge_references(ticket, article_id):
+                # Only the saved title/content are compared; revision, source and enabled state are not.
+                stale = snapshot["title"] != entry["title"] or snapshot["content"] != entry["content"]
+                if not stale:
+                    continue
+                if pending_only and self._review_covers(confirmed, descriptor, entry):
+                    continue
+                references.append(descriptor)
             if references:
                 matched.append({"ticket": ticket, "references": references})
         matched.sort(key=lambda item: item["ticket"]["ticket_id"])
         return {"total": len(matched), "items": matched[offset:offset + limit]}
+
+    def review_knowledge(self, ticket_id, article_id):
+        ticket_id, article_id = text(ticket_id, "ticket_id"), text(article_id, "article_id")
+        data = self._read()
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] == "closed":
+            raise ValueError("ticket must exist and be open")
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        # The confirmation covers every reference that is stale right now; already
+        # confirmed ones are counted and re-confirmed, and later-added references
+        # (even with an identical snapshot) get no record and stay pending.
+        stale = [descriptor for descriptor, snapshot in self._knowledge_references(ticket, article_id)
+                 if snapshot["title"] != entry["title"] or snapshot["content"] != entry["content"]]
+        if stale:
+            bucket = data.setdefault("knowledge_reviews", {}).setdefault(article_id, {}).setdefault(ticket_id, [])
+            changed = False
+            for descriptor in stale:
+                latest = next((record for record in reversed(bucket)
+                               if record["kind"] == descriptor["kind"] and record["index"] == descriptor["index"]), None)
+                # Re-confirming the same content is idempotent; changed content appends a new record.
+                if latest is None or latest["title"] != entry["title"] or latest["content"] != entry["content"]:
+                    bucket.append({"kind": descriptor["kind"], "index": descriptor["index"],
+                                   "title": entry["title"], "content": entry["content"]})
+                    changed = True
+            if changed:
+                self._write(data)
+        return {"ticket_id": ticket_id, "article_id": article_id, "reviewed_count": len(stale)}
 
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):
