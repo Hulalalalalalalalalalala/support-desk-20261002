@@ -275,6 +275,22 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
+    def receive(self, ticket_id, message, received_at):
+        ticket_id, message = text(ticket_id, "ticket_id"), text(message, "message")
+        received_at = minute(received_at, "received_at")
+        data = self._read()
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] != "open" or "opened_at" not in ticket:
+            raise ValueError("ticket must exist, be open and have opened_at")
+        if received_at < ticket["opened_at"]:
+            raise ValueError("received_at must not be earlier than opened_at")
+        messages = ticket.get("customer_messages")
+        if messages and received_at < messages[-1]["received_at"]:
+            raise ValueError("received_at must not be earlier than the last customer message")
+        ticket.setdefault("customer_messages", []).append({"message": message, "received_at": received_at})
+        self._write(data)
+        return ticket
+
     def response_stats(self):
         tickets = list(self._read().get("tickets", {}).values())
         timed = [t for t in tickets if "opened_at" in t]
@@ -334,6 +350,51 @@ class SupportDesk(JsonStore):
         items.sort(key=lambda item: (item["last_answered_at"], PRIORITY_RANK[item["priority"]],
                                      item["ticket"]["ticket_id"]))
         return {"as_of": as_of, "items": items}
+
+    def customer_queue(self, as_of, target_minutes=30):
+        as_of = minute(as_of, "as_of")
+        target_minutes = positive(target_minutes, "target_minutes")
+        considered = []
+        for ticket in self._read().get("tickets", {}).values():
+            if ticket["status"] != "open":
+                continue
+            messages = ticket.get("customer_messages")
+            # Only tickets with a (non-empty) follow-up history take part.
+            if not messages:
+                continue
+            response = ticket.get("first_response")
+            # Missing, null or empty first responses carry no answering time.
+            if isinstance(response, dict) and response:
+                boundary = response["responded_at"]
+            else:
+                boundary = None
+            replies = ticket.get("replies") or []
+            if replies:
+                last_reply_at = replies[-1]["replied_at"]
+                if boundary is None or last_reply_at > boundary:
+                    boundary = last_reply_at
+            # Any follow-up or answer later than as_of invalidates the whole query.
+            if any(message["received_at"] > as_of for message in messages):
+                raise ValueError("customer message time must not be later than as_of")
+            if isinstance(response, dict) and response and response["responded_at"] > as_of:
+                raise ValueError("response time must not be later than as_of")
+            if any(reply["replied_at"] > as_of for reply in replies):
+                raise ValueError("response time must not be later than as_of")
+            considered.append((ticket, messages, boundary))
+        items = []
+        for ticket, messages, boundary in considered:
+            # A follow-up at the same minute as an answer counts as covered.
+            unanswered = [message for message in messages
+                          if boundary is None or message["received_at"] > boundary]
+            if not unanswered:
+                continue
+            first_at = unanswered[0]["received_at"]
+            waiting = as_of - first_at
+            row = {"ticket": ticket, "count": len(unanswered),
+                   "waiting_minutes": waiting, "overdue": waiting > target_minutes}
+            items.append((first_at, row))
+        items.sort(key=lambda pair: (pair[0], pair[1]["ticket"]["ticket_id"]))
+        return [row for _, row in items]
 
     def response_target_report(self, as_of, targets=None):
         as_of = minute(as_of, "as_of")
