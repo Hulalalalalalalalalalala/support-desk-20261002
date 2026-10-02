@@ -2669,5 +2669,214 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.stdout, "")
         self.assertIn("error", json.loads(failed.stderr))
 
+    def _open_assigned(self, ticket_id, assignee, opened_at=None, priority=None):
+        self.app.open_ticket(ticket_id, "Cust" + ticket_id, "Subject " + ticket_id,
+                             opened_at=opened_at)
+        self.app.assign(ticket_id, assignee)
+        if priority is not None:
+            self.app.set_priority(ticket_id, priority)
+
+    def test_handover_balances_load_persists_history_and_updates_workload(self):
+        self._open_assigned("T-busy-1", "Rcpt", opened_at=1)
+        self._open_assigned("T-src-1", "Bob", opened_at=2)
+        self._open_assigned("T-src-2", "Bob", opened_at=3)
+        self._open_assigned("T-src-3", "Bob", opened_at=4)
+        result = self.app.handover(" Bob ", ["  Rcpt  ", "Ann"], "  team\nshuffle ", 10)
+        self.assertEqual([t["ticket_id"] for t in result],
+                         ["T-src-1", "T-src-2", "T-src-3"])
+        # Rcpt starts with one open ticket: T-src-1 goes to Ann (load 0), then loads
+        # tie at 1 with Ann winning the tie, and T-src-3 goes to Rcpt (load 1 vs 2).
+        self.assertEqual([t["assignee"] for t in result], ["Ann", "Ann", "Rcpt"])
+        history = {t["ticket_id"]: t["transfer_history"] for t in result}
+        self.assertEqual(history["T-src-1"],
+                         [{"from_assignee": "Bob", "to_assignee": "Ann",
+                           "reason": "team\nshuffle", "transferred_at": 10}])
+        self.assertEqual(history["T-src-3"][0]["to_assignee"], "Rcpt")
+        reloaded = SupportDesk(self.root)
+        self.assertEqual(reloaded.get("T-src-1")["assignee"], "Ann")
+        self.assertEqual(reloaded.get("T-src-3")["assignee"], "Rcpt")
+        groups = {g["assignee"]: g["open"] for g in reloaded.assignee_workload_report(10)["groups"]}
+        self.assertEqual(groups, {"Ann": 2, "Rcpt": 2})
+        self.assertNotIn("Bob", groups)
+        self.assertEqual(reloaded.handover("Bob", ["Ann"], "again", 11), [])
+
+    def test_handover_orders_by_priority_opened_at_missing_last_then_id(self):
+        self._open_assigned("T-low", "Bob", opened_at=1, priority="low")
+        self._open_assigned("T-untimed", "Bob")
+        self._open_assigned("T-b", "Bob", opened_at=5)
+        self._open_assigned("T-a", "Bob", opened_at=5)
+        self._open_assigned("T-urgent", "Bob", opened_at=9, priority="urgent")
+        result = self.app.handover("Bob", ["x"], "r", 20, max_open=10)
+        self.assertEqual([t["ticket_id"] for t in result],
+                         ["T-urgent", "T-a", "T-b", "T-untimed", "T-low"])
+
+    def test_handover_only_selects_open_tickets_of_exact_source(self):
+        self._open_assigned("T-src", "Bob", opened_at=1)
+        self._open_assigned("T-other", "Ann", opened_at=1)
+        self.app.open_ticket("T-unassigned", "c", "s", opened_at=1)
+        self._open_assigned("T-closed", "Bob", opened_at=1)
+        self.app.close("T-closed", "Done")
+        result = self.app.handover("bob", ["Ann"], "r", 5)  # names are case-sensitive
+        self.assertEqual(result, [])
+        result = self.app.handover("Bob", ["Ann"], "r", 5)
+        self.assertEqual([t["ticket_id"] for t in result], ["T-src"])
+        self.assertEqual(SupportDesk(self.root).get("T-other")["assignee"], "Ann")
+        self.assertIsNone(SupportDesk(self.root).get("T-unassigned")["assignee"])
+        self.assertEqual(SupportDesk(self.root).get("T-closed")["assignee"], "Bob")
+
+    def test_handover_tie_breaks_recipients_by_case_sensitive_name(self):
+        self._open_assigned("T-1", "Bob", opened_at=1)
+        self._open_assigned("T-2", "Bob", opened_at=2)
+        # input order must not affect the outcome
+        result = self.app.handover("Bob", ["ann", "Ann"], "r", 5, max_open=10)
+        self.assertEqual([t["assignee"] for t in result], ["Ann", "ann"])
+
+    def test_handover_appends_after_existing_history_and_allows_equal_minute(self):
+        self._open_assigned("T-1", "Bob", opened_at=1)
+        self.app.transfer_ticket("T-1", "Cara", "first", 8)
+        self.app.transfer_ticket("T-1", "Bob", "back", 9)
+        result = self.app.handover("Bob", ["Ann"], "second wave", 9)  # equal to last transfer/opened+
+        ticket = result[0]
+        self.assertEqual([(h["from_assignee"], h["to_assignee"], h["reason"], h["transferred_at"])
+                          for h in ticket["transfer_history"]],
+                         [("Bob", "Cara", "first", 8), ("Cara", "Bob", "back", 9),
+                          ("Bob", "Ann", "second wave", 9)])
+
+    def test_handover_rejects_time_regression_without_partial_changes(self):
+        self._open_assigned("T-ok", "Bob", opened_at=5)
+        self._open_assigned("T-early", "Bob", opened_at=20)
+        self._open_assigned("T-history", "Bob", opened_at=1)
+        self.app.transfer_ticket("T-history", "Cara", "old", 15)
+        self.app.transfer_ticket("T-history", "Bob", "back", 16)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.handover("Bob", ["Ann"], "r", 19)  # before T-early opened_at
+        with self.assertRaises(ValueError):
+            self.app.handover("Bob", ["Ann"], "r", 15)  # before last transfer
+        self.assertEqual(before, self.app.path.read_bytes())
+        for ticket_id in ("T-ok", "T-early", "T-history"):
+            self.assertEqual(self.app.get(ticket_id)["assignee"], "Bob")
+        self.assertEqual(len(self.app.get("T-history")["transfer_history"]), 2)
+        self.assertNotIn("transfer_history", self.app.get("T-ok"))
+        # tickets without opened_at skip the opened_at check entirely
+        self._open_assigned("T-untimed", "Bob")
+        result = self.app.handover("Bob", ["Ann"], "r", 20)
+        self.assertEqual({t["ticket_id"] for t in result},
+                         {"T-ok", "T-early", "T-history", "T-untimed"})
+
+    def test_handover_insufficient_capacity_is_atomic(self):
+        self._open_assigned("T-full", "Ann", opened_at=0)
+        self._open_assigned("T-1", "Bob", opened_at=1)
+        self._open_assigned("T-2", "Bob", opened_at=2)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.handover("Bob", ["Ann"], "r", 10, max_open=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.get("T-1")["assignee"], "Bob")
+        self.assertNotIn("transfer_history", self.app.get("T-1"))
+
+    def test_handover_preserves_fields_and_adds_no_notes_or_response_changes(self):
+        self._open_assigned("T-1", "Bob", opened_at=1, priority="high")
+        self.app.set_category("T-1", "network")
+        self.app.note("T-1", "seen")
+        self.app.respond("T-1", "on it", 2)
+        self.app.reply("T-1", "again", 3)
+        result = self.app.handover("Bob", ["Ann"], "  keep  gaps  ", 4)
+        ticket = result[0]
+        self.assertEqual((ticket["category"], ticket["priority"], ticket["notes"],
+                          ticket["first_response"], ticket["replies"], ticket["status"]),
+                         ("network", "high", ["seen"],
+                          {"message": "on it", "responded_at": 2},
+                          [{"message": "again", "replied_at": 3}], "open"))
+        self.assertEqual(ticket["transfer_history"][0]["reason"], "keep  gaps")
+        reloaded = SupportDesk(self.root).get("T-1")
+        self.assertEqual(reloaded["notes"], ["seen"])
+        self.assertEqual(reloaded["assignee"], "Ann")
+
+    def test_handover_no_selection_returns_empty_and_creates_nothing(self):
+        missing = self.root / "missing"
+        self.assertEqual(SupportDesk(missing).handover("Bob", ["Ann"], "r", 1), [])
+        self.assertFalse(missing.exists())
+        self.app.open_ticket("T", "c", "s", opened_at=1)
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.handover("Nobody", ["Ann"], "r", 1), [])
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_handover_rejects_bad_input_without_writing(self):
+        self._open_assigned("T-1", "Bob", opened_at=1)
+        before = self.app.path.read_bytes()
+        for source in (None, 1, True, " ", ["Bob"]):
+            with self.assertRaises(ValueError, msg=source):
+                self.app.handover(source, ["Ann"], "r", 5)
+        for assignees in (None, "Ann", [], {}, ["Ann", " Ann"], ["Ann", ""],
+                          ["Ann", None], [1], [True], ["Ann", "Bob"]):
+            with self.assertRaises(ValueError, msg=assignees):
+                self.app.handover("Bob", assignees, "r", 5)
+        for reason in (None, 1, True, " "):
+            with self.assertRaises(ValueError, msg=reason):
+                self.app.handover("Bob", ["Ann"], reason, 5)
+        for at in (True, False, 1.5, "5", None, -1):
+            with self.assertRaises(ValueError, msg=at):
+                self.app.handover("Bob", ["Ann"], "r", at)
+        for cap in (0, -1, True, False, 1.5, "5", None):
+            with self.assertRaises(ValueError, msg=cap):
+                self.app.handover("Bob", ["Ann"], "r", 5, cap)
+        with self.assertRaises(TypeError):
+            self.app.handover("Bob", ["Ann"])
+        with self.assertRaises(TypeError):
+            self.app.handover("Bob", ["Ann"], "r")
+        with self.assertRaises(TypeError):
+            self.app.handover("Bob", ["Ann"], "r", 5, unknown=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.get("T-1")["assignee"], "Bob")
+
+    def test_handover_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.handover("Bob", [], "r", 5)
+        with self.assertRaises(ValueError):
+            app.handover("Bob", ["Ann"], "r", -1)
+        self.assertFalse(fresh.exists())
+
+    def test_cli_handover_success_failure_and_batch(self):
+        self._open_assigned("T-1", "Bob", opened_at=1)
+        self._open_assigned("T-2", "Bob", opened_at=2)
+        payload = self.root / "handover.json"
+        payload.write_text(json.dumps({"source_assignee": "Bob", "assignees": ["Ann", "Rcpt"],
+                                       "reason": "shift", "transferred_at": 5}),
+                           encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "handover", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in value],
+                         [("T-1", "Ann"), ("T-2", "Rcpt")])
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"source_assignee": "Bob", "assignees": [],
+                                   "reason": "r", "transferred_at": 5}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "handover", str(bad)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        # batch: requests submit independently, later failure keeps earlier successes
+        self._open_assigned("T-3", "Bob", opened_at=3)
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"source_assignee": "Bob", "assignees": ["Ann"], "reason": "r", "transferred_at": 6},
+            {"source_assignee": "Bob", "assignees": [], "reason": "r", "transferred_at": 7},
+        ]), encoding="utf-8")
+        failed_batch = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                       str(self.root), "handover", str(batch)],
+                                      text=True, capture_output=True)
+        self.assertEqual(failed_batch.returncode, 2)
+        self.assertEqual(failed_batch.stdout, "")
+        self.assertIn("error", json.loads(failed_batch.stderr))
+        stored = SupportDesk(self.root)
+        self.assertEqual(stored.get("T-3")["assignee"], "Ann")
+
 if __name__ == "__main__":
     unittest.main()
