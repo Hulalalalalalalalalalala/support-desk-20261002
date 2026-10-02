@@ -216,20 +216,71 @@ class SupportDesk(JsonStore):
             raise ValueError("source ticket must exist and be closed")
         entry = {"article_id": article_id, "source_ticket_id": ticket_id, "title": ticket["subject"], "content": ticket["resolution"]}
         data.setdefault("knowledge", {})[article_id] = entry
+        data.setdefault("knowledge_history", {})[article_id] = [
+            {"revision": 1, "title": entry["title"], "content": entry["content"]}
+        ]
         self._write(data)
         return entry
+
+    def _find_article(self, data, article_id):
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        return entry
+
+    def _revisions(self, data, article_id):
+        # Legacy articles without stored history use their current content as
+        # revision 1; the virtual revision is never written back.
+        entry = data["knowledge"][article_id]
+        stored = data.get("knowledge_history", {}).get(article_id)
+        if stored:
+            return stored
+        return [{"revision": 1, "title": entry["title"], "content": entry["content"]}]
 
     def update_knowledge(self, article_id, title, content):
         article_id, title, content = (text(article_id, "article_id"),
                                       text(title, "title"),
                                       text(content, "content"))
         data = self._read()
-        entry = data.get("knowledge", {}).get(article_id)
-        if entry is None:
-            raise ValueError("unknown knowledge article")
-        entry["title"] = title
-        entry["content"] = content
-        self._write(data)
+        entry = self._find_article(data, article_id)
+        if title != entry["title"] or content != entry["content"]:
+            # Resolve revisions before replacing the current content so that a
+            # legacy article without stored history keeps its old content as
+            # revision 1 and the actual change becomes revision 2.
+            revisions = self._revisions(data, article_id)
+            revisions.append({"revision": revisions[-1]["revision"] + 1,
+                              "title": title, "content": content})
+            data.setdefault("knowledge_history", {})[article_id] = revisions
+            entry["title"] = title
+            entry["content"] = content
+            self._write(data)
+        return entry
+
+    def knowledge_history(self, article_id):
+        article_id = text(article_id, "article_id")
+        data = self._read()
+        self._find_article(data, article_id)
+        return [{"revision": revision["revision"],
+                 "title": revision["title"],
+                 "content": revision["content"]}
+                for revision in self._revisions(data, article_id)]
+
+    def restore_knowledge(self, article_id, revision):
+        article_id = text(article_id, "article_id")
+        revision = positive(revision, "revision")
+        data = self._read()
+        entry = self._find_article(data, article_id)
+        revisions = self._revisions(data, article_id)
+        match = next((item for item in revisions if item["revision"] == revision), None)
+        if match is None:
+            raise ValueError("unknown knowledge revision")
+        if match["title"] != entry["title"] or match["content"] != entry["content"]:
+            revisions.append({"revision": revisions[-1]["revision"] + 1,
+                              "title": match["title"], "content": match["content"]})
+            data.setdefault("knowledge_history", {})[article_id] = revisions
+            entry["title"] = match["title"]
+            entry["content"] = match["content"]
+            self._write(data)
         return entry
 
     def search_knowledge(self, query=None):

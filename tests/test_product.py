@@ -909,5 +909,191 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([(h["reason"], h["resolution"]) for h in history],
                          [("Still broken\n多行。", "Sent link"), ("again", "Second fix")])
 
+    def test_knowledge_history_starts_at_revision_one_and_update_appends(self):
+        self._closed_ticket("T-1", subject="S", resolution="甲")
+        self._closed_ticket("T-2", subject="S2", resolution="丙")
+        self.app.publish_knowledge("KB-1", "T-1")
+        self.app.publish_knowledge("KB-2", "T-2")
+        self.assertEqual(self.app.knowledge_history(" KB-1 "),
+                         [{"revision": 1, "title": "S", "content": "甲"}])
+        # each article numbers its revisions independently
+        self.app.update_knowledge("KB-1", "S", "乙")
+        self.app.update_knowledge("KB-2", "S2", "丁")
+        self.assertEqual([r["revision"] for r in self.app.knowledge_history("KB-1")], [1, 2])
+        self.assertEqual([r["revision"] for r in self.app.knowledge_history("KB-2")], [1, 2])
+        # identical normalized content succeeds without adding a revision
+        self.app.update_knowledge("KB-1", " S ", "乙")
+        history = self.app.knowledge_history("KB-1")
+        self.assertEqual([(r["revision"], r["content"]) for r in history],
+                         [(1, "甲"), (2, "乙")])
+        self.assertEqual([sorted(r) for r in history], [["content", "revision", "title"],
+                                                        ["content", "revision", "title"]])
+
+    def test_restore_appends_revision_and_keeps_numbering_monotonic(self):
+        self._closed_ticket("T", subject="S", resolution="甲")
+        self.app.publish_knowledge("KB-1", "T")
+        self.app.update_knowledge("KB-1", "S", "乙")
+        # restoring revision 1 keeps 甲, 乙, 甲 as revisions 1, 2, 3
+        entry = self.app.restore_knowledge(" KB-1 ", 1)
+        self.assertEqual(entry, {"article_id": "KB-1", "source_ticket_id": "T",
+                                 "title": "S", "content": "甲"})
+        history = self.app.knowledge_history("KB-1")
+        self.assertEqual([(r["revision"], r["content"]) for r in history],
+                         [(1, "甲"), (2, "乙"), (3, "甲")])
+        # a later edit becomes revision 4
+        self.app.update_knowledge("KB-1", "S", "新")
+        self.assertEqual([r["revision"] for r in self.app.knowledge_history("KB-1")],
+                         [1, 2, 3, 4])
+        # restoring the current content succeeds without adding a revision
+        current = self.app.restore_knowledge("KB-1", 4)
+        self.assertEqual(current["content"], "新")
+        self.assertEqual([r["revision"] for r in self.app.knowledge_history("KB-1")],
+                         [1, 2, 3, 4])
+        # restoring an older revision copies its content but never rewrites history
+        again = self.app.restore_knowledge("KB-1", 2)
+        self.assertEqual(again["content"], "乙")
+        self.assertEqual([(r["revision"], r["content"]) for r in self.app.knowledge_history("KB-1")],
+                         [(1, "甲"), (2, "乙"), (3, "甲"), (4, "新"), (5, "乙")])
+
+    def test_history_and_restore_persist_across_recreation(self):
+        self._closed_ticket("T", subject="S", resolution="甲")
+        self.app.publish_knowledge("KB-1", "T")
+        self.app.update_knowledge("KB-1", "S", "乙")
+        reloaded = SupportDesk(self.root)
+        self.assertEqual(reloaded.restore_knowledge("KB-1", 1)["content"], "甲")
+        again = SupportDesk(self.root)
+        self.assertEqual([(r["revision"], r["content"]) for r in again.knowledge_history("KB-1")],
+                         [(1, "甲"), (2, "乙"), (3, "甲")])
+        self.assertEqual(again.search_knowledge()[0]["content"], "甲")
+
+    def test_legacy_article_uses_current_as_revision_one_without_backfill(self):
+        self._closed_ticket("T", subject="S", resolution="旧")
+        self.app.publish_knowledge("KB-1", "T")
+        # simulate an old entry predating history storage
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        del raw["knowledge_history"]
+        self.app.path.write_text(json.dumps(raw, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        legacy = SupportDesk(self.root)
+        self.assertEqual(legacy.knowledge_history("KB-1"),
+                         [{"revision": 1, "title": "S", "content": "旧"}])
+        before = self.app.path.read_bytes()
+        legacy.knowledge_history("KB-1")
+        self.assertEqual(before, self.app.path.read_bytes())
+        stored = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertNotIn("knowledge_history", stored)
+        # the first real change materializes revision 1 (old) and revision 2
+        entry = legacy.update_knowledge("KB-1", "S", "新")
+        self.assertEqual(entry["content"], "新")
+        self.assertEqual([(r["revision"], r["content"]) for r in legacy.knowledge_history("KB-1")],
+                         [(1, "旧"), (2, "新")])
+        # restoring the current content succeeds without adding a revision
+        self.assertEqual(legacy.restore_knowledge("KB-1", 2)["content"], "新")
+        self.assertEqual([r["revision"] for r in legacy.knowledge_history("KB-1")], [1, 2])
+
+    def test_disabled_article_can_be_queried_restored_and_keeps_state(self):
+        self._knowledge_response_setup()
+        self.app.update_knowledge("KB-1", "Download", "Updated")
+        self.app.set_knowledge_enabled("KB-1", False)
+        history = self.app.knowledge_history("KB-1")
+        self.assertEqual([r["revision"] for r in history], [1, 2])
+        entry = self.app.restore_knowledge("KB-1", 1)
+        self.assertEqual(entry["content"], "Sent link")
+        # still disabled: hidden from search, refused by knowledge-respond
+        self.assertEqual(self.app.search_knowledge(), [])
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.respond_with_knowledge("T-tgt", "KB-1", 8)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.app.set_knowledge_enabled("KB-1", True)
+        self.assertEqual(self.app.search_knowledge("sent link")[0]["content"], "Sent link")
+
+    def test_history_rejects_bad_article_without_writing(self):
+        self._closed_ticket()
+        self.app.publish_knowledge("KB-1", "T")
+        before = self.app.path.read_bytes()
+        for article_id in [None, 1, True, [], {}, " "]:
+            with self.assertRaises(ValueError, msg=article_id):
+                self.app.knowledge_history(article_id)
+        with self.assertRaises(ValueError):
+            self.app.knowledge_history("kb-1")
+        with self.assertRaises(ValueError):
+            self.app.knowledge_history("KB-X")
+        with self.assertRaises(TypeError):
+            self.app.knowledge_history()
+        with self.assertRaises(TypeError):
+            self.app.knowledge_history("KB-1", "extra")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_restore_rejects_bad_input_without_writing(self):
+        self._closed_ticket()
+        self.app.publish_knowledge("KB-1", "T")
+        self.app.update_knowledge("KB-1", "S", "乙")
+        before = self.app.path.read_bytes()
+        for article_id in [None, 1, True, " "]:
+            with self.assertRaises(ValueError, msg=article_id):
+                self.app.restore_knowledge(article_id, 1)
+        for revision in [True, False, 1.0, 1.5, "1", None, [], {}, 0, -1]:
+            with self.assertRaises(ValueError, msg=revision):
+                self.app.restore_knowledge("KB-1", revision)
+        with self.assertRaises(ValueError):
+            self.app.restore_knowledge("KB-1", 3)
+        with self.assertRaises(ValueError):
+            self.app.restore_knowledge("kb-1", 1)
+        with self.assertRaises(ValueError):
+            self.app.restore_knowledge("KB-X", 1)
+        with self.assertRaises(TypeError):
+            self.app.restore_knowledge("KB-1")
+        with self.assertRaises(TypeError):
+            self.app.restore_knowledge("KB-1", 1, "extra")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.search_knowledge()[0]["content"], "乙")
+
+    def test_history_and_restore_failure_create_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.knowledge_history("KB-1")
+        self.assertFalse(fresh.exists())
+        with self.assertRaises(ValueError):
+            app.restore_knowledge("KB-1", 1)
+        self.assertFalse(fresh.exists())
+
+    def test_cli_knowledge_history_and_restore(self):
+        self._closed_ticket()
+        self.app.publish_knowledge("KB-1", "T")
+        self.app.update_knowledge("KB-1", "Download", "乙")
+        payload = self.root / "history.json"
+        payload.write_text(json.dumps({"article_id": " KB-1 "}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-history", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([(r["revision"], r["content"]) for r in json.loads(result.stdout)],
+                         [(1, "Sent link"), (2, "乙")])
+        missing = self.root / "bad.json"
+        missing.write_text(json.dumps({"article_id": "KB-X"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-history", str(missing)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        restore = self.root / "restore.json"
+        restore.write_text(json.dumps({"article_id": "KB-1", "revision": 1}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-restore", str(restore)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         {"article_id": "KB-1", "source_ticket_id": "T",
+                          "title": "Download", "content": "Sent link"})
+        # batch stops at the first error and prints no partial results
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"article_id": "KB-1", "revision": 2},
+            {"article_id": "KB-1", "revision": 99},
+            {"article_id": "KB-1", "revision": 1},
+        ]), encoding="utf-8")
+        failed_batch = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-restore", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed_batch.returncode, 2)
+        self.assertIn("error", json.loads(failed_batch.stderr))
+        self.assertEqual(failed_batch.stdout, "")
+        reloaded = SupportDesk(self.root)
+        self.assertEqual([(r["revision"], r["content"]) for r in reloaded.knowledge_history("KB-1")],
+                         [(1, "Sent link"), (2, "乙"), (3, "Sent link"), (4, "乙")])
+
 if __name__ == "__main__":
     unittest.main()
