@@ -216,8 +216,22 @@ class SupportDesk(JsonStore):
             raise ValueError("source ticket must exist and be closed")
         entry = {"article_id": article_id, "source_ticket_id": ticket_id, "title": ticket["subject"], "content": ticket["resolution"]}
         data.setdefault("knowledge", {})[article_id] = entry
+        data.setdefault("knowledge_history", {})[article_id] = [
+            {"revision": 1, "title": entry["title"], "content": entry["content"]}
+        ]
         self._write(data)
         return entry
+
+    def _append_revision(self, data, article_id, entry, title, content):
+        histories = data.setdefault("knowledge_history", {})
+        history = histories.get(article_id)
+        if history is None:
+            # Articles written before history existed keep their current content as revision 1.
+            history = [{"revision": 1, "title": entry["title"], "content": entry["content"]}]
+            histories[article_id] = history
+        history.append({"revision": history[-1]["revision"] + 1, "title": title, "content": content})
+        entry["title"] = title
+        entry["content"] = content
 
     def update_knowledge(self, article_id, title, content):
         article_id, title, content = (text(article_id, "article_id"),
@@ -227,9 +241,42 @@ class SupportDesk(JsonStore):
         entry = data.get("knowledge", {}).get(article_id)
         if entry is None:
             raise ValueError("unknown knowledge article")
-        entry["title"] = title
-        entry["content"] = content
-        self._write(data)
+        if title != entry["title"] or content != entry["content"]:
+            self._append_revision(data, article_id, entry, title, content)
+            self._write(data)
+        return entry
+
+    def knowledge_history(self, article_id):
+        article_id = text(article_id, "article_id")
+        data = self._read()
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        history = data.get("knowledge_history", {}).get(article_id)
+        if history is None:
+            # Old articles without stored history use their current content as revision 1;
+            # the missing record is never reconstructed or backfilled.
+            history = [{"revision": 1, "title": entry["title"], "content": entry["content"]}]
+        return [{"revision": item["revision"], "title": item["title"], "content": item["content"]}
+                for item in history]
+
+    def restore_knowledge(self, article_id, revision):
+        article_id = text(article_id, "article_id")
+        revision = positive(revision, "revision")
+        data = self._read()
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        history = data.get("knowledge_history", {}).get(article_id)
+        if history is None:
+            source = {"revision": 1, "title": entry["title"], "content": entry["content"]} if revision == 1 else None
+        else:
+            source = next((item for item in history if item["revision"] == revision), None)
+        if source is None:
+            raise ValueError("unknown knowledge revision")
+        if source["title"] != entry["title"] or source["content"] != entry["content"]:
+            self._append_revision(data, article_id, entry, source["title"], source["content"])
+            self._write(data)
         return entry
 
     def search_knowledge(self, query=None):
