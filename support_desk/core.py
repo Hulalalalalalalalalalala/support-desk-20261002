@@ -303,6 +303,47 @@ class SupportDesk(JsonStore):
             groups.append({"priority": priority, "target_minutes": target, **counts, "on_time_rate": rate})
         return {"as_of": as_of, "groups": groups}
 
+    def assignee_workload_report(self, as_of, response_minutes=30, follow_up_minutes=60):
+        as_of = minute(as_of, "as_of")
+        response_minutes = positive(response_minutes, "response_minutes")
+        follow_up_minutes = positive(follow_up_minutes, "follow_up_minutes")
+        groups = {}
+        def bucket(assignee):
+            return groups.setdefault(assignee, {"assignee": assignee, "open": 0, "pending": 0,
+                                               "overdue": 0, "follow_up": 0,
+                                               "follow_up_overdue": 0, "untimed": 0})
+        for ticket in self._read().get("tickets", {}).values():
+            if ticket["status"] != "open":
+                continue
+            counts = bucket(ticket.get("assignee"))
+            counts["open"] += 1
+            response = ticket.get("first_response")
+            # Only a non-empty first-response object counts as responded; missing, null or {} are pending.
+            if not isinstance(response, dict) or not response:
+                if "opened_at" in ticket:
+                    if ticket["opened_at"] > as_of:
+                        raise ValueError("opened_at must not be later than as_of")
+                    counts["pending"] += 1
+                    if as_of - ticket["opened_at"] > response_minutes:
+                        counts["overdue"] += 1
+                else:
+                    counts["untimed"] += 1
+            else:
+                counts["follow_up"] += 1
+                replies = ticket.get("replies")
+                if replies:
+                    last_answered_at = replies[-1]["replied_at"]
+                else:
+                    last_answered_at = response["responded_at"]
+                if response["responded_at"] > as_of or any(reply["replied_at"] > as_of for reply in replies or []):
+                    raise ValueError("response time must not be later than as_of")
+                if as_of - last_answered_at > follow_up_minutes:
+                    counts["follow_up_overdue"] += 1
+        ordered = [groups[name] for name in sorted(n for n in groups if n is not None)]
+        if None in groups:
+            ordered.insert(0, groups[None])
+        return {"as_of": as_of, "groups": ordered}
+
     def publish_knowledge(self, article_id, ticket_id):
         article_id, ticket_id = text(article_id, "article_id"), text(ticket_id, "ticket_id")
         data = self._read()
