@@ -1455,5 +1455,138 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(failed.stderr))
         self.assertFalse(missing.exists())
 
+    def _usage_scenario(self):
+        self._closed_ticket("T-src", subject="Download", resolution="Sent link")
+        self._closed_ticket("T-src2", subject="Password", resolution="Reset it")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.publish_knowledge("kb-2", "T-src2")
+        # T-1: knowledge first response at 5, two knowledge replies at 8, manual reply at 9
+        self.app.open_ticket("T-1", "Alice", "Need help", opened_at=5)
+        self.app.respond_with_knowledge("T-1", "KB-1", 5)
+        self.app.reply_with_knowledge("T-1", "KB-1", 8)
+        self.app.reply_with_knowledge("T-1", "KB-1", 8)
+        self.app.reply("T-1", "Anything else?", 9)
+        # T-2: manual first response at 5, knowledge reply at 6
+        self.app.open_ticket("T-2", "Bob", "Other", opened_at=4)
+        self.app.respond("T-2", "Hi", 5)
+        self.app.reply_with_knowledge("T-2", "KB-1", 6)
+
+    def test_knowledge_usage_report_counts_range_and_recreation(self):
+        self._usage_scenario()
+        report = self.app.knowledge_usage_report(5, 9)
+        self.assertEqual([row["article"]["article_id"] for row in report], ["KB-1", "kb-2"])
+        first, second = report
+        self.assertEqual(first["article"],
+                         {"article_id": "KB-1", "source_ticket_id": "T-src",
+                          "title": "Download", "content": "Sent link"})
+        self.assertEqual(first["enabled"], True)
+        self.assertEqual((first["first_responses"], first["replies"],
+                          first["ticket_count"], first["last_used_at"]), (1, 3, 2, 8))
+        self.assertEqual((second["first_responses"], second["replies"],
+                          second["ticket_count"], second["last_used_at"]), (0, 0, 0, None))
+        # [5, 8) counts the first response at 5 and the reply at 6, but not the replies at 8
+        bounded = self.app.knowledge_usage_report(5, 8)
+        self.assertEqual((bounded[0]["first_responses"], bounded[0]["replies"],
+                          bounded[0]["ticket_count"], bounded[0]["last_used_at"]), (1, 1, 2, 6))
+        # equal bounds count nothing; omitted until is unbounded
+        empty = self.app.knowledge_usage_report(5, 5)
+        self.assertEqual((empty[0]["first_responses"], empty[0]["replies"],
+                          empty[0]["ticket_count"], empty[0]["last_used_at"]), (0, 0, 0, None))
+        unbounded = self.app.knowledge_usage_report(6)
+        self.assertEqual((unbounded[0]["first_responses"], unbounded[0]["replies"],
+                          unbounded[0]["ticket_count"], unbounded[0]["last_used_at"]), (0, 3, 2, 8))
+        self.assertEqual(self.app.knowledge_usage_report(), SupportDesk(self.root).knowledge_usage_report())
+
+    def test_knowledge_usage_report_keeps_counts_through_changes(self):
+        self._usage_scenario()
+        self.app.update_knowledge("KB-1", "Download v2", "New link")
+        self.app.restore_knowledge("KB-1", 1)
+        self.app.set_knowledge_enabled("KB-1", False)
+        self.app.assign("T-1", "Bob")
+        self.app.close("T-1", "Done")
+        self.app.reopen_ticket("T-1", "not fixed")
+        report = SupportDesk(self.root).knowledge_usage_report(0)
+        first = report[0]
+        # article shows current content and current enabled state; stored references are unchanged
+        self.assertEqual((first["article"]["title"], first["article"]["content"]),
+                         ("Download", "Sent link"))
+        self.assertEqual(first["enabled"], False)
+        self.assertEqual((first["first_responses"], first["replies"],
+                          first["ticket_count"], first["last_used_at"]), (1, 3, 2, 8))
+
+    def test_knowledge_usage_report_legacy_tickets_and_empty_directory(self):
+        # old tickets without first_response or replies are treated as empty records
+        self._closed_ticket("T-src", subject="Download", resolution="Sent link")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T-legacy", "Alice", "Old")
+        report = self.app.knowledge_usage_report(0)
+        self.assertEqual(len(report), 1)
+        self.assertEqual((report[0]["first_responses"], report[0]["replies"],
+                          report[0]["ticket_count"], report[0]["last_used_at"]), (0, 0, 0, None))
+        # no knowledge at all, or a missing directory, returns []
+        empty = SupportDesk(self.root / "missing")
+        self.assertEqual(empty.knowledge_usage_report(), [])
+        self.assertFalse((self.root / "missing").exists())
+        self.assertEqual(SupportDesk(self.root / "other").knowledge_usage_report(3, 4), [])
+        self.assertFalse((self.root / "other").exists())
+
+    def test_knowledge_usage_report_rejects_bad_arguments_without_writing(self):
+        self._usage_scenario()
+        before = self.app.path.read_bytes()
+        for bad in (None, True, 1.5, "5", -1):
+            with self.assertRaises(ValueError):
+                self.app.knowledge_usage_report(bad)
+        for bad in (True, 2.5, "9", -2):
+            with self.assertRaises(ValueError):
+                self.app.knowledge_usage_report(0, bad)
+        with self.assertRaises(ValueError):
+            self.app.knowledge_usage_report(9, 8)
+        with self.assertRaises(TypeError):
+            self.app.knowledge_usage_report(0, 9, 10)
+        with self.assertRaises(TypeError):
+            self.app.knowledge_usage_report(since=0, unknown=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # a failed query against a missing root creates neither directory nor file
+        missing = self.root / "missing"
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).knowledge_usage_report(-1)
+        self.assertFalse(missing.exists())
+
+    def test_cli_knowledge_usage_report(self):
+        self._usage_scenario()
+        payload = self.root / "usage.json"
+        payload.write_text(json.dumps({"since": 5, "until": 9}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "knowledge-usage-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual([row["article"]["article_id"] for row in report], ["KB-1", "kb-2"])
+        self.assertEqual((report[0]["first_responses"], report[0]["replies"],
+                          report[0]["ticket_count"], report[0]["last_used_at"]), (1, 3, 2, 8))
+        # defaults work without an input file
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "knowledge-usage-report"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)[0]["last_used_at"], 8)
+        # failures exit 2 with an error object on stderr and nothing on stdout
+        payload.write_text(json.dumps({"since": None}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "knowledge-usage-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        payload.write_text(json.dumps({"since": 0, "extra": 1}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "knowledge-usage-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        # an empty root prints [] and creates nothing
+        missing = self.root / "missing"
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(missing),
+                                 "knowledge-usage-report"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [])
+        self.assertFalse(missing.exists())
+
 if __name__ == "__main__":
     unittest.main()

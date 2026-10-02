@@ -354,6 +354,43 @@ class SupportDesk(JsonStore):
         self._write(data)
         return {"article": entry, "enabled": enabled}
 
+    def knowledge_usage_report(self, since=0, until=None):
+        since = minute(since, "since")
+        if until is not None:
+            until = minute(until, "until")
+            if until < since:
+                raise ValueError("until must not be earlier than since")
+        data = self._read()
+        usage = {}
+        def record(article_id, ticket_id, at, kind):
+            if at < since or (until is not None and at >= until):
+                return
+            stats = usage.setdefault(article_id, {"first_responses": 0, "replies": 0, "tickets": set(), "last_used_at": None})
+            stats[kind] += 1
+            stats["tickets"].add(ticket_id)
+            if stats["last_used_at"] is None or at > stats["last_used_at"]:
+                stats["last_used_at"] = at
+        for ticket in data.get("tickets", {}).values():
+            response = ticket.get("first_response")
+            if response is not None and response.get("knowledge") is not None:
+                record(response["knowledge"]["article_id"], ticket["ticket_id"], response["responded_at"], "first_responses")
+            for reply in ticket.get("replies") or []:
+                if reply.get("knowledge") is not None:
+                    record(reply["knowledge"]["article_id"], ticket["ticket_id"], reply["replied_at"], "replies")
+        states = data.get("knowledge_enabled", {})
+        report = []
+        for article_id in sorted(data.get("knowledge", {})):
+            stats = usage.get(article_id)
+            report.append({
+                "article": data["knowledge"][article_id],
+                "enabled": states.get(article_id, True),
+                "first_responses": stats["first_responses"] if stats else 0,
+                "replies": stats["replies"] if stats else 0,
+                "ticket_count": len(stats["tickets"]) if stats else 0,
+                "last_used_at": stats["last_used_at"] if stats else None,
+            })
+        return report
+
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")
