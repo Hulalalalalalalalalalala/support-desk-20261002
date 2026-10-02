@@ -261,5 +261,107 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([e["article_id"] for e in json.loads(result.stdout)], ["KB-2"])
 
+    def _knowledge_response_setup(self):
+        self._closed_ticket("T-src", subject="Download", resolution="Sent link")
+        entry = self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T-tgt", "Alice", "Need download", opened_at=5)
+        return entry
+
+    def test_respond_with_knowledge_persists_snapshot(self):
+        entry = self._knowledge_response_setup()
+        self.app.assign("T-tgt", "Bob")
+        self.app.note("T-tgt", "Checking")
+        self.app.set_priority("T-tgt", "high")
+        ticket = self.app.respond_with_knowledge(" T-tgt ", "KB-1", 7)
+        self.assertEqual(ticket["first_response"],
+                         {"message": "Sent link", "responded_at": 7, "knowledge": dict(entry)})
+        self.assertEqual((ticket["status"], ticket["assignee"], ticket["notes"],
+                          ticket["resolution"], ticket["priority"]),
+                         ("open", "Bob", ["Checking"], None, "high"))
+        reloaded = SupportDesk(self.root).get("T-tgt")
+        self.assertEqual(reloaded["first_response"],
+                         {"message": "Sent link", "responded_at": 7, "knowledge": dict(entry)})
+        # knowledge entry and its source ticket stay untouched
+        self.assertEqual(SupportDesk(self.root).search_knowledge(), [entry])
+        source = self.app.get("T-src")
+        self.assertEqual((source["status"], source["resolution"]), ("closed", "Sent link"))
+
+    def test_respond_with_knowledge_allows_equal_minute_and_unassigned_target(self):
+        self._knowledge_response_setup()
+        ticket = self.app.respond_with_knowledge("T-tgt", "KB-1", 5)
+        self.assertIsNone(ticket["assignee"])
+        self.assertEqual(ticket["first_response"]["responded_at"], 5)
+
+    def test_respond_with_knowledge_shares_uniqueness_with_respond(self):
+        self._knowledge_response_setup()
+        self.app.respond("T-tgt", "Manual", 6)
+        with self.assertRaises(ValueError):
+            self.app.respond_with_knowledge("T-tgt", "KB-1", 7)
+        self.app.open_ticket("T-other", "Bob", "Other", opened_at=5)
+        self.app.respond_with_knowledge("T-other", "KB-1", 6)
+        with self.assertRaises(ValueError):
+            self.app.respond("T-other", "Manual", 7)
+
+    def test_respond_with_knowledge_counts_in_stats_queue_report(self):
+        self._knowledge_response_setup()
+        self.app.respond_with_knowledge("T-tgt", "KB-1", 6)
+        stats = self.app.response_stats()
+        self.assertEqual((stats["timed"], stats["responded"], stats["pending"]), (1, 1, 0))
+        self.assertEqual((stats["average_minutes"], stats["max_minutes"]), (1, 1))
+        queue = self.app.response_queue(10)
+        self.assertEqual(queue["items"], [])
+        report = self.app.response_target_report(10)
+        normal = next(group for group in report["groups"] if group["priority"] == "normal")
+        self.assertEqual((normal["responded"], normal["on_time"], normal["late"]), (1, 1, 0))
+        priorities = [(item["ticket"]["ticket_id"], item["priority"]) for item in self.app.priority_queue()]
+        self.assertEqual(priorities, [("T-tgt", "normal")])
+
+    def test_respond_with_knowledge_rejects_bad_input_without_writing(self):
+        self._knowledge_response_setup()
+        self.app.open_ticket("T-untimed", "Bob", "No clock")
+        self._closed_ticket("T-closed", subject="Other", resolution="Done")
+        before = self.app.path.read_bytes()
+        for ticket_id, article_id, responded_at in [
+            (None, "KB-1", 6), (1, "KB-1", 6), (" ", "KB-1", 6),
+            ("T-tgt", None, 6), ("T-tgt", 1, 6), ("T-tgt", " ", 6),
+            ("T-tgt", "KB-1", True), ("T-tgt", "KB-1", 1.5),
+            ("T-tgt", "KB-1", "6"), ("T-tgt", "KB-1", None),
+            ("T-tgt", "KB-1", -1), ("T-tgt", "KB-1", 4),
+            ("missing", "KB-1", 6), ("T-closed", "KB-1", 6),
+            ("T-untimed", "KB-1", 6), ("T-tgt", "kb-1", 6),
+            ("T-tgt", "KB-X", 6),
+        ]:
+            with self.assertRaises(ValueError, msg=(ticket_id, article_id, responded_at)):
+                self.app.respond_with_knowledge(ticket_id, article_id, responded_at)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertIsNone(self.app.get("T-tgt")["first_response"])
+
+    def test_respond_with_knowledge_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.respond_with_knowledge("T", "KB-1", 3)
+        self.assertFalse(fresh.exists())
+
+    def test_cli_respond_with_knowledge(self):
+        self._knowledge_response_setup()
+        self.app.open_ticket("T-other", "Bob", "Other", opened_at=5)
+        payload = self.root / "respond.json"
+        payload.write_text(json.dumps({"ticket_id": "T-tgt", "article_id": "KB-1", "responded_at": 6}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-respond", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["first_response"]["message"], "Sent link")
+        self.assertEqual(value["first_response"]["knowledge"]["article_id"], "KB-1")
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"ticket_id": "T-other", "article_id": "KB-1", "responded_at": 6},
+            {"ticket_id": "T-tgt", "article_id": "KB-1", "responded_at": 7},
+        ]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-respond", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(SupportDesk(self.root).get("T-other")["first_response"]["responded_at"], 6)
+
 if __name__ == "__main__":
     unittest.main()
