@@ -101,6 +101,8 @@ class SupportDesk(JsonStore):
         entry = data.get("knowledge", {}).get(article_id)
         if entry is None:
             raise ValueError("unknown knowledge article")
+        if not data.get("knowledge_enabled", {}).get(article_id, True):
+            raise ValueError("knowledge article is disabled")
         if responded_at < ticket["opened_at"]:
             raise ValueError("responded_at must not be earlier than opened_at")
         ticket["first_response"] = {
@@ -226,11 +228,27 @@ class SupportDesk(JsonStore):
             raise ValueError("query must be a nonempty string")
         else:
             terms = [term.casefold() for term in query.strip().split()]
-        entries = sorted(self._read().get("knowledge", {}).values(), key=lambda entry: entry["article_id"])
+        data = self._read()
+        states = data.get("knowledge_enabled", {})
+        entries = sorted((entry for entry in data.get("knowledge", {}).values()
+                          if states.get(entry["article_id"], True)),
+                         key=lambda entry: entry["article_id"])
         if terms is None:
             return entries
         return [entry for entry in entries
                 if all(term in entry["title"].casefold() or term in entry["content"].casefold() for term in terms)]
+
+    def set_knowledge_enabled(self, article_id, enabled):
+        article_id = text(article_id, "article_id")
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        data = self._read()
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        data.setdefault("knowledge_enabled", {})[article_id] = enabled
+        self._write(data)
+        return {"article": entry, "enabled": enabled}
 
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):

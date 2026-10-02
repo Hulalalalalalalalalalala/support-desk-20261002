@@ -676,5 +676,110 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(sum(g["responded"] + g["pending"] for g in report["groups"]), 0)
         self.assertFalse(missing.exists())
 
+    def test_set_knowledge_enabled_persists_and_repeat_is_quiet(self):
+        self._closed_ticket()
+        entry = self.app.publish_knowledge("KB-1", "T")
+        result = self.app.set_knowledge_enabled(" KB-1 ", False)
+        self.assertEqual(result, {"article": entry, "enabled": False})
+        again = self.app.set_knowledge_enabled("KB-1", False)
+        self.assertEqual(again, {"article": entry, "enabled": False})
+        reloaded = SupportDesk(self.root)
+        self.assertEqual(reloaded.search_knowledge(), [])
+        restored = reloaded.set_knowledge_enabled("KB-1", True)
+        self.assertEqual(restored, {"article": entry, "enabled": True})
+        self.assertEqual(SupportDesk(self.root).search_knowledge(), [entry])
+
+    def test_set_knowledge_enabled_rejects_bad_input_without_writing(self):
+        self._closed_ticket()
+        self.app.publish_knowledge("KB-1", "T")
+        before = self.app.path.read_bytes()
+        for article_id, enabled in [(None, True), (1, True), (" ", True), ("kb-1", True),
+                                    ("KB-X", True), ("KB-1", None), ("KB-1", 1), ("KB-1", 0),
+                                    ("KB-1", 1.0), ("KB-1", "true"), ("KB-1", []), ("KB-1", {})]:
+            with self.assertRaises(ValueError, msg=(article_id, enabled)):
+                self.app.set_knowledge_enabled(article_id, enabled)
+        with self.assertRaises(TypeError):
+            self.app.set_knowledge_enabled("KB-1")
+        with self.assertRaises(TypeError):
+            self.app.set_knowledge_enabled("KB-1", True, "extra")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.search_knowledge()[0]["content"], "Sent link")
+
+    def test_set_knowledge_enabled_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.set_knowledge_enabled("KB-1", False)
+        self.assertFalse(fresh.exists())
+
+    def test_disabled_article_hidden_from_search_and_respond(self):
+        self._knowledge_response_setup()
+        self._closed_ticket("T-src-2", subject="Billing", resolution="Refunded")
+        self.app.publish_knowledge("KB-2", "T-src-2")
+        self.app.set_knowledge_enabled("KB-1", False)
+        self.assertEqual([e["article_id"] for e in self.app.search_knowledge()], ["KB-2"])
+        self.assertEqual([e["article_id"] for e in self.app.search_knowledge(None)], ["KB-2"])
+        self.assertEqual(self.app.search_knowledge("download"), [])
+        self.assertEqual([e["article_id"] for e in self.app.search_knowledge("refunded")], ["KB-2"])
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.respond_with_knowledge("T-tgt", "KB-1", 6)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertIsNone(self.app.get("T-tgt")["first_response"])
+        self.app.set_knowledge_enabled("KB-1", True)
+        ticket = self.app.respond_with_knowledge("T-tgt", "KB-1", 6)
+        self.assertEqual(ticket["first_response"]["message"], "Sent link")
+        self.assertEqual([e["article_id"] for e in self.app.search_knowledge()], ["KB-1", "KB-2"])
+
+    def test_disable_keeps_fields_occupancy_snapshots_and_allows_update(self):
+        self._knowledge_response_setup()
+        self.app.respond_with_knowledge("T-tgt", "KB-1", 6)
+        self.app.set_knowledge_enabled("KB-1", False)
+        # the four fields, the identifier and the source ticket's publish occupancy stay
+        with self.assertRaises(ValueError):
+            self.app.publish_knowledge("KB-1", "T-src")
+        with self.assertRaises(ValueError):
+            self.app.publish_knowledge("KB-2", "T-src")
+        # a disabled article can still be revised without being re-enabled
+        entry = self.app.update_knowledge("KB-1", "Download", "New link")
+        self.assertEqual(entry, {"article_id": "KB-1", "source_ticket_id": "T-src",
+                                 "title": "Download", "content": "New link"})
+        self.assertEqual(self.app.search_knowledge(), [])
+        # the saved first response keeps its original message and snapshot
+        saved = self.app.get("T-tgt")["first_response"]
+        self.assertEqual(saved["message"], "Sent link")
+        self.assertEqual(saved["knowledge"],
+                         {"article_id": "KB-1", "source_ticket_id": "T-src",
+                          "title": "Download", "content": "Sent link"})
+        # entries never expose the enabled state through existing read paths
+        self.app.set_knowledge_enabled("KB-1", True)
+        self.assertNotIn("enabled", self.app.search_knowledge()[0])
+        self.app.open_ticket("T-new", "Bob", "Need download", opened_at=7)
+        ticket = self.app.respond_with_knowledge("T-new", "KB-1", 8)
+        self.assertEqual(sorted(ticket["first_response"]["knowledge"]),
+                         ["article_id", "content", "source_ticket_id", "title"])
+
+    def test_cli_knowledge_enabled_set(self):
+        self._closed_ticket()
+        self.app.publish_knowledge("KB-1", "T")
+        payload = self.root / "disable.json"
+        payload.write_text(json.dumps({"article_id": "KB-1", "enabled": False}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-enabled-set", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["enabled"], False)
+        self.assertEqual(value["article"],
+                         {"article_id": "KB-1", "source_ticket_id": "T", "title": "Download", "content": "Sent link"})
+        self.assertEqual(SupportDesk(self.root).search_knowledge(), [])
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([{"article_id": "KB-1", "enabled": True},
+                                     {"article_id": "KB-1", "enabled": "yes"},
+                                     {"article_id": "KB-1", "enabled": False}]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-enabled-set", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(failed.stdout, "")
+        self.assertEqual([e["article_id"] for e in SupportDesk(self.root).search_knowledge()], ["KB-1"])
+
 if __name__ == "__main__":
     unittest.main()
