@@ -2376,5 +2376,210 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(failed.stderr))
         self.assertFalse(missing.exists())
 
+    def test_review_knowledge_confirms_stale_references(self):
+        self._review_scenario()
+        # make KB-2 stale too, so its queue is observable
+        self.app.update_knowledge("KB-2", "Password v2", "New reset")
+        result = self.app.review_knowledge(" T-a ", " KB-1 ")
+        self.assertEqual(result, {"ticket_id": "T-a", "article_id": "KB-1", "reviewed_count": 3})
+        # the full queue is unchanged, but T-a has nothing left pending
+        self.assertEqual(self.app.knowledge_review_queue("KB-1")["total"], 3)
+        queue = self.app.knowledge_review_queue("KB-1", pending_only=True)
+        self.assertEqual(queue["total"], 2)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in queue["items"]], ["T-A", "T-b"])
+        # the confirmation survives a recreated desk
+        self.assertEqual(SupportDesk(self.root).knowledge_review_queue("KB-1", pending_only=True),
+                         queue)
+        # repeating the review succeeds and still counts the stale references
+        self.assertEqual(self.app.review_knowledge("T-a", "KB-1")["reviewed_count"], 3)
+        # other articles are unaffected: T-a's stale KB-2 reply is still pending
+        queue = self.app.knowledge_review_queue("KB-2", pending_only=True)
+        self.assertEqual(queue["total"], 1)
+        self.assertEqual(queue["items"][0]["references"], [{"kind": "reply", "index": 2}])
+
+    def test_review_knowledge_zero_count_writes_nothing(self):
+        self._review_scenario()
+        self.app.restore_knowledge("KB-1", 1)
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.review_knowledge("T-a", "KB-1"),
+                         {"ticket_id": "T-a", "article_id": "KB-1", "reviewed_count": 0})
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_review_knowledge_disabled_article_and_disabled_queue(self):
+        self._review_scenario()
+        self.app.set_knowledge_enabled("KB-1", False)
+        self.assertEqual(self.app.review_knowledge("T-a", "KB-1")["reviewed_count"], 3)
+        queue = self.app.knowledge_review_queue("KB-1", pending_only=True)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in queue["items"]], ["T-A", "T-b"])
+
+    def test_review_knowledge_content_change_invalidates_and_restore_revalidates(self):
+        self._review_scenario()
+        self.app.review_knowledge("T-a", "KB-1")
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", pending_only=True)["total"], 2)
+        # changing the current content invalidates the confirmations
+        self.app.update_knowledge("KB-1", "Download v3", "Link v3")
+        queue = self.app.knowledge_review_queue("KB-1", pending_only=True)
+        self.assertEqual(queue["total"], 3)
+        self.assertEqual(queue["items"][1]["references"],
+                         [{"kind": "first_response", "index": None},
+                          {"kind": "reply", "index": 0},
+                          {"kind": "reply", "index": 3}])
+        # restoring the reviewed content revalidates the confirmations
+        self.app.restore_knowledge("KB-1", 2)
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", pending_only=True)["total"], 2)
+        # a different content invalidates them again
+        self.app.update_knowledge("KB-1", "Download v4", "Link v4")
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", pending_only=True)["total"], 3)
+
+    def test_review_knowledge_only_covers_references_existing_at_submission(self):
+        self._review_scenario()
+        self.app.review_knowledge("T-a", "KB-1")
+        # a later reply with the same stale snapshot needs its own review
+        self.app.reply_with_knowledge("T-a", "KB-1", 10, revision=1)
+        queue = self.app.knowledge_review_queue("KB-1", pending_only=True)
+        self.assertEqual(queue["total"], 3)
+        self.assertEqual(queue["items"][1]["ticket"]["ticket_id"], "T-a")
+        self.assertEqual(queue["items"][1]["references"], [{"kind": "reply", "index": 4}])
+        # the next review covers every stale reference, already-confirmed ones included
+        self.assertEqual(self.app.review_knowledge("T-a", "KB-1")["reviewed_count"], 4)
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", pending_only=True)["total"], 2)
+
+    def test_review_knowledge_close_and_reopen(self):
+        self._review_scenario()
+        self.app.review_knowledge("T-a", "KB-1")
+        self.app.assign("T-a", "Eve")
+        self.app.close("T-a", "Done")
+        with self.assertRaises(ValueError):
+            self.app.review_knowledge("T-a", "KB-1")
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", pending_only=True)["total"], 2)
+        # reopening keeps the confirmations, judged against the current content
+        self.app.reopen_ticket("T-a", "not fixed")
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", pending_only=True)["total"], 2)
+        self.app.update_knowledge("KB-1", "Download v3", "Link v3")
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", pending_only=True)["total"], 3)
+
+    def test_review_knowledge_does_not_rewrite_other_data(self):
+        self._review_scenario()
+        before = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.app.review_knowledge("T-a", "KB-1")
+        after = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertEqual(set(after) - set(before), {"knowledge_reviews"})
+        for key in before:
+            self.assertEqual(after[key], before[key])
+        self.assertEqual(self.app.get("T-a")["first_response"]["knowledge"]["content"], "Sent link")
+
+    def test_review_knowledge_rejects_bad_arguments_without_writing(self):
+        self._review_scenario()
+        before = self.app.path.read_bytes()
+        for bad in (None, 1, 1.5, True, "", "  ", ["T-a"]):
+            with self.assertRaises(ValueError):
+                self.app.review_knowledge(bad, "KB-1")
+            with self.assertRaises(ValueError):
+                self.app.review_knowledge("T-a", bad)
+        # the lookups are case-sensitive
+        with self.assertRaises(ValueError):
+            self.app.review_knowledge("t-a", "KB-1")
+        with self.assertRaises(ValueError):
+            self.app.review_knowledge("T-a", "kb-1")
+        with self.assertRaises(ValueError):
+            self.app.review_knowledge("T-X", "KB-1")
+        with self.assertRaises(ValueError):
+            self.app.review_knowledge("T-a", "KB-X")
+        # closed tickets cannot be reviewed
+        with self.assertRaises(ValueError):
+            self.app.review_knowledge("T-c", "KB-1")
+        with self.assertRaises(TypeError):
+            self.app.review_knowledge()
+        with self.assertRaises(TypeError):
+            self.app.review_knowledge("T-a")
+        with self.assertRaises(TypeError):
+            self.app.review_knowledge("T-a", "KB-1", unknown=1)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        # a failure against a missing root creates neither directory nor file
+        missing = self.root / "missing"
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).review_knowledge("T-a", "KB-1")
+        self.assertFalse(missing.exists())
+
+    def test_knowledge_review_queue_pending_only_filters_and_paginates(self):
+        self._review_scenario()
+        for bad in (0, 1, "true", None, 1.5):
+            with self.assertRaises(ValueError):
+                self.app.knowledge_review_queue("KB-1", pending_only=bad)
+        # omitted or false keeps the full result
+        full = self.app.knowledge_review_queue("KB-1")
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", pending_only=False), full)
+        self.app.review_knowledge("T-a", "KB-1")
+        # T-a has no remaining references and drops out of the total
+        queue = self.app.knowledge_review_queue("KB-1", pending_only=True)
+        self.assertEqual(queue["total"], 2)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in queue["items"]], ["T-A", "T-b"])
+        # partial confirmation: only the unconfirmed references remain
+        self.app.reply_with_knowledge("T-a", "KB-1", 10, revision=1)
+        queue = self.app.knowledge_review_queue("KB-1", pending_only=True)
+        self.assertEqual(queue["total"], 3)
+        self.assertEqual(queue["items"][1]["references"], [{"kind": "reply", "index": 4}])
+        # sorting and pagination apply after filtering
+        page = self.app.knowledge_review_queue("KB-1", pending_only=True, offset=1, limit=1)
+        self.assertEqual(page["total"], 3)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in page["items"]], ["T-a"])
+        self.assertEqual(self.app.knowledge_review_queue("KB-1", pending_only=True, offset=3),
+                         {"total": 3, "items": []})
+        # pending_only is read-only
+        before = self.app.path.read_bytes()
+        self.app.knowledge_review_queue("KB-1", pending_only=True)
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_cli_knowledge_review(self):
+        self._review_scenario()
+        payload = self.root / "review-one.json"
+        payload.write_text(json.dumps({"ticket_id": " T-a ", "article_id": "KB-1"}),
+                           encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "knowledge-review", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         {"ticket_id": "T-a", "article_id": "KB-1", "reviewed_count": 3})
+        # array input preserves the input order and per-item successes
+        payload.write_text(json.dumps([{"ticket_id": "T-A", "article_id": "KB-1"},
+                                       {"ticket_id": "T-b", "article_id": "KB-1"}]),
+                           encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "knowledge-review", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         [{"ticket_id": "T-A", "article_id": "KB-1", "reviewed_count": 1},
+                          {"ticket_id": "T-b", "article_id": "KB-1", "reviewed_count": 1}])
+        payload.write_text(json.dumps({"article_id": "KB-1", "pending_only": True}),
+                           encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "knowledge-review-queue", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"total": 0, "items": []})
+        # failures exit 2 with an error object on stderr and nothing on stdout
+        payload.write_text(json.dumps([{"ticket_id": "T-a", "article_id": "KB-1"},
+                                       {"ticket_id": "T-X", "article_id": "KB-1"}]),
+                           encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "knowledge-review", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        # a failure against a missing root creates neither directory nor file
+        missing = self.root / "missing"
+        payload.write_text(json.dumps({"ticket_id": "T-a", "article_id": "KB-1"}),
+                           encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(missing), "knowledge-review", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertFalse(missing.exists())
+
 if __name__ == "__main__":
     unittest.main()

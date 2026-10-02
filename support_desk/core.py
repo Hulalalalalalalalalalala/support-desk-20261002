@@ -445,35 +445,74 @@ class SupportDesk(JsonStore):
             })
         return report
 
-    def knowledge_review_queue(self, article_id, offset=0, limit=20):
+    def _stale_references(self, ticket, entry, article_id):
+        def stale(snapshot):
+            # Only the saved title/content are compared; revision, source and enabled state are not.
+            return snapshot["title"] != entry["title"] or snapshot["content"] != entry["content"]
+        references = []
+        response = ticket.get("first_response")
+        # Missing, null or empty first responses carry no reference.
+        if isinstance(response, dict):
+            knowledge = response.get("knowledge")
+            if knowledge is not None and knowledge["article_id"] == article_id and stale(knowledge):
+                references.append({"kind": "first_response", "index": None})
+        for index, reply in enumerate(ticket.get("replies") or []):
+            knowledge = reply.get("knowledge")
+            if knowledge is not None and knowledge["article_id"] == article_id and stale(knowledge):
+                references.append({"kind": "reply", "index": index})
+        return references
+
+    def _review_key(self, reference):
+        if reference["kind"] == "first_response":
+            return "first_response"
+        return "reply:" + str(reference["index"])
+
+    def review_knowledge(self, ticket_id, article_id):
+        ticket_id, article_id = text(ticket_id, "ticket_id"), text(article_id, "article_id")
+        data = self._read()
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] != "open":
+            raise ValueError("ticket must exist and be open")
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        references = self._stale_references(ticket, entry, article_id)
+        if references:
+            # A confirmation stamps the article's current title/content per covered
+            # reference; it stays valid only while the current content still matches.
+            confirmations = (data.setdefault("knowledge_reviews", {})
+                             .setdefault(ticket_id, {}).setdefault(article_id, {}))
+            for reference in references:
+                confirmations[self._review_key(reference)] = {"title": entry["title"],
+                                                              "content": entry["content"]}
+            self._write(data)
+        return {"ticket_id": ticket_id, "article_id": article_id,
+                "reviewed_count": len(references)}
+
+    def knowledge_review_queue(self, article_id, offset=0, limit=20, pending_only=False):
         article_id = text(article_id, "article_id")
         # bool is a subclass of int, so compare types explicitly; floats and strings are rejected too.
         if type(offset) is not int or offset < 0:
             raise ValueError("offset must be a nonnegative integer")
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
+        if type(pending_only) is not bool:
+            raise ValueError("pending_only must be a boolean")
         data = self._read()
         entry = data.get("knowledge", {}).get(article_id)
         if entry is None:
             raise ValueError("unknown knowledge article")
-        def stale(snapshot):
-            # Only the saved title/content are compared; revision, source and enabled state are not.
-            return snapshot["title"] != entry["title"] or snapshot["content"] != entry["content"]
+        reviews = data.get("knowledge_reviews", {})
+        current = {"title": entry["title"], "content": entry["content"]}
         matched = []
         for ticket in data.get("tickets", {}).values():
             if ticket["status"] != "open":
                 continue
-            references = []
-            response = ticket.get("first_response")
-            # Missing, null or empty first responses carry no reference.
-            if isinstance(response, dict):
-                knowledge = response.get("knowledge")
-                if knowledge is not None and knowledge["article_id"] == article_id and stale(knowledge):
-                    references.append({"kind": "first_response", "index": None})
-            for index, reply in enumerate(ticket.get("replies") or []):
-                knowledge = reply.get("knowledge")
-                if knowledge is not None and knowledge["article_id"] == article_id and stale(knowledge):
-                    references.append({"kind": "reply", "index": index})
+            references = self._stale_references(ticket, entry, article_id)
+            if pending_only:
+                confirmations = reviews.get(ticket["ticket_id"], {}).get(article_id, {})
+                references = [reference for reference in references
+                              if confirmations.get(self._review_key(reference)) != current]
             if references:
                 matched.append({"ticket": ticket, "references": references})
         matched.sort(key=lambda item: item["ticket"]["ticket_id"])
