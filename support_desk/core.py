@@ -2,6 +2,8 @@ from .storage import JsonStore, text, minute, positive
 
 PRIORITIES = ("urgent", "high", "normal", "low")
 PRIORITY_RANK = {name: index for index, name in enumerate(PRIORITIES)}
+DEFAULT_TARGETS = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
+REPORT_COUNTS = ("responded", "on_time", "late", "pending", "overdue", "untimed", "closed_without_response")
 
 class SupportDesk(JsonStore):
     def open_ticket(self, ticket_id, customer, subject, opened_at=None):
@@ -118,6 +120,61 @@ class SupportDesk(JsonStore):
             items.append({"ticket": ticket, "waiting_minutes": waiting, "overdue": waiting > target_minutes})
         items.sort(key=lambda item: (item["ticket"]["opened_at"], item["ticket"]["ticket_id"]))
         return {"untimed": untimed, "items": items}
+
+    def response_target_report(self, as_of, targets=None):
+        as_of = minute(as_of, "as_of")
+        if targets is None:
+            targets = dict(DEFAULT_TARGETS)
+        elif not isinstance(targets, dict):
+            raise ValueError("targets must be an object or null")
+        else:
+            merged = dict(DEFAULT_TARGETS)
+            for priority, value in targets.items():
+                if priority not in PRIORITY_RANK:
+                    raise ValueError("targets has an unknown priority key")
+                merged[priority] = positive(value, "target for " + priority)
+            targets = merged
+        counts = {priority: {name: 0 for name in REPORT_COUNTS} for priority in PRIORITIES}
+        for ticket in self._read().get("tickets", {}).values():
+            priority = ticket.get("priority", "normal")
+            group = counts[priority]
+            if "opened_at" not in ticket:
+                group["untimed"] += 1
+                continue
+            if ticket["opened_at"] > as_of:
+                raise ValueError("opened_at must not be later than as_of")
+            response = ticket.get("first_response")
+            if response is not None:
+                responded_at = response["responded_at"]
+                if responded_at > as_of:
+                    raise ValueError("responded_at must not be later than as_of")
+                group["responded"] += 1
+                if responded_at - ticket["opened_at"] <= targets[priority]:
+                    group["on_time"] += 1
+                else:
+                    group["late"] += 1
+            elif ticket["status"] == "closed":
+                group["closed_without_response"] += 1
+            else:
+                group["pending"] += 1
+                if as_of - ticket["opened_at"] > targets[priority]:
+                    group["overdue"] += 1
+        groups = []
+        for priority in PRIORITIES:
+            group = counts[priority]
+            groups.append({
+                "priority": priority,
+                "target_minutes": targets[priority],
+                "responded": group["responded"],
+                "on_time": group["on_time"],
+                "late": group["late"],
+                "pending": group["pending"],
+                "overdue": group["overdue"],
+                "untimed": group["untimed"],
+                "closed_without_response": group["closed_without_response"],
+                "on_time_rate": group["on_time"] / group["responded"] if group["responded"] else None,
+            })
+        return {"as_of": as_of, "groups": groups}
 
     def publish_knowledge(self, article_id, ticket_id):
         article_id, ticket_id = text(article_id, "article_id"), text(ticket_id, "ticket_id")
