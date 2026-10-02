@@ -664,6 +664,135 @@ class ProductTests(unittest.TestCase):
             self.assertEqual(result.stdout, "")
         self.assertEqual(before, self.app.path.read_bytes())
 
+    def _published_article(self, article_id="KB-1", ticket_id="T", subject="Download", resolution="Sent link"):
+        self._closed_ticket(ticket_id, subject=subject, resolution=resolution)
+        return self.app.publish_knowledge(article_id, ticket_id)
+
+    def test_set_knowledge_enabled_persists_and_is_idempotent(self):
+        entry = self._published_article()
+        result = self.app.set_knowledge_enabled(" KB-1 ", False)
+        self.assertEqual(result, {"article": entry, "enabled": False})
+        again = self.app.set_knowledge_enabled("KB-1", False)
+        self.assertEqual(again, {"article": entry, "enabled": False})
+        restored = SupportDesk(self.root).set_knowledge_enabled("KB-1", True)
+        self.assertEqual(restored, {"article": entry, "enabled": True})
+        self.assertEqual(SupportDesk(self.root).search_knowledge(), [entry])
+
+    def test_disabled_article_hidden_from_search_and_respond(self):
+        entry = self._published_article()
+        self.app.open_ticket("T-tgt", "Alice", "Need download", opened_at=5)
+        self.app.set_knowledge_enabled("KB-1", False)
+        self.assertEqual(self.app.search_knowledge(), [])
+        self.assertEqual(self.app.search_knowledge(None), [])
+        self.assertEqual(self.app.search_knowledge("download"), [])
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.respond_with_knowledge("T-tgt", "KB-1", 6)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertIsNone(self.app.get("T-tgt")["first_response"])
+        self.app.set_knowledge_enabled("KB-1", True)
+        ticket = self.app.respond_with_knowledge("T-tgt", "KB-1", 6)
+        self.assertEqual(ticket["first_response"]["knowledge"], entry)
+        self.assertEqual(self.app.search_knowledge(), [entry])
+
+    def test_disable_keeps_fields_source_occupation_and_snapshots(self):
+        entry = self._published_article()
+        self.app.open_ticket("T-tgt", "Alice", "Need download", opened_at=5)
+        self.app.respond_with_knowledge("T-tgt", "KB-1", 6)
+        self.app.set_knowledge_enabled("KB-1", False)
+        # identifiers and source-ticket occupation are not released
+        with self.assertRaises(ValueError):
+            self.app.publish_knowledge("KB-1", "T")
+        self._closed_ticket("T-2", subject="Other", resolution="Done")
+        with self.assertRaises(ValueError):
+            self.app.publish_knowledge("KB-2", "T")
+        # revision still allowed and does not re-enable
+        revised = self.app.update_knowledge("KB-1", "Download", "New link")
+        self.assertEqual(revised, {"article_id": "KB-1", "source_ticket_id": "T",
+                                   "title": "Download", "content": "New link"})
+        self.assertEqual(self.app.search_knowledge(), [])
+        # saved first response and its snapshot stay untouched
+        saved = self.app.get("T-tgt")["first_response"]
+        self.assertEqual(saved["message"], "Sent link")
+        self.assertEqual(saved["knowledge"], entry)
+
+    def test_knowledge_enabled_not_exposed_in_existing_results(self):
+        self._published_article()
+        self.app.set_knowledge_enabled("KB-1", False)
+        self.app.set_knowledge_enabled("KB-1", True)
+        for result in (self.app.search_knowledge(),
+                       [self.app.update_knowledge("KB-1", "Download", "Sent link")]):
+            for entry in result:
+                self.assertNotIn("enabled", entry)
+        self.app.open_ticket("T-tgt", "Alice", "Need download", opened_at=5)
+        ticket = self.app.respond_with_knowledge("T-tgt", "KB-1", 6)
+        self.assertNotIn("enabled", ticket["first_response"]["knowledge"])
+        raw = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertIs(raw["knowledge"]["KB-1"]["enabled"], True)
+
+    def test_historical_entry_without_state_is_enabled(self):
+        entry = self._published_article()
+        data = json.loads(self.app.path.read_text(encoding="utf-8"))
+        del data["knowledge"]["KB-1"]["enabled"]
+        self.app.path.write_text(json.dumps(data), encoding="utf-8")
+        app = SupportDesk(self.root)
+        self.assertEqual(app.search_knowledge(), [entry])
+        self.app.open_ticket("T-tgt", "Alice", "Need download", opened_at=5)
+        ticket = app.respond_with_knowledge("T-tgt", "KB-1", 6)
+        self.assertEqual(ticket["first_response"]["knowledge"], entry)
+        # reads never backfill the state field
+        self.assertNotIn("enabled", json.loads(self.app.path.read_text(encoding="utf-8"))["knowledge"]["KB-1"])
+
+    def test_set_knowledge_enabled_rejects_bad_input_without_writing(self):
+        self._published_article()
+        before = self.app.path.read_bytes()
+        for article_id, enabled in [(None, True), (1, False), (" ", True),
+                                    ("KB-1", None), ("KB-1", 1), ("KB-1", 0),
+                                    ("KB-1", "true"), ("KB-1", "false"), ("KB-1", ""),
+                                    ("kb-1", True), ("KB-X", False)]:
+            with self.assertRaises(ValueError, msg=(article_id, enabled)):
+                self.app.set_knowledge_enabled(article_id, enabled)
+        with self.assertRaises(TypeError):
+            self.app.set_knowledge_enabled("KB-1")
+        with self.assertRaises(TypeError):
+            self.app.set_knowledge_enabled("KB-1", True, "extra")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.search_knowledge("download")[0]["article_id"], "KB-1")
+
+    def test_set_knowledge_enabled_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.set_knowledge_enabled("KB-1", False)
+        self.assertFalse(fresh.exists())
+
+    def test_cli_knowledge_enabled_set(self):
+        self._published_article()
+        payload = self.root / "disable.json"
+        payload.write_text(json.dumps({"article_id": "KB-1", "enabled": False}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-enabled-set", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         {"article": {"article_id": "KB-1", "source_ticket_id": "T",
+                                      "title": "Download", "content": "Sent link"},
+                          "enabled": False})
+        self.assertEqual(self.app.search_knowledge(), [])
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([{"article_id": "KB-1", "enabled": True},
+                                     {"article_id": "KB-X", "enabled": False},
+                                     {"article_id": "KB-1", "enabled": False}]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-enabled-set", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(failed.stdout, "")
+        self.assertEqual([e["article_id"] for e in SupportDesk(self.root).search_knowledge()], ["KB-1"])
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"article_id": "KB-1", "enabled": "yes"}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "knowledge-enabled-set", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(failed.stdout, "")
+
     def test_cli_response_target_report_empty_directory_creates_nothing(self):
         missing = self.root / "missing"
         payload = self.root / "report.json"

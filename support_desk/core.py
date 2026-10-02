@@ -3,6 +3,11 @@ from .storage import JsonStore, text, minute, positive
 PRIORITIES = ("urgent", "high", "normal", "low")
 PRIORITY_RANK = {name: index for index, name in enumerate(PRIORITIES)}
 
+KNOWLEDGE_FIELDS = ("article_id", "source_ticket_id", "title", "content")
+
+def public_knowledge(entry):
+    return {field: entry[field] for field in KNOWLEDGE_FIELDS}
+
 class SupportDesk(JsonStore):
     def open_ticket(self, ticket_id, customer, subject, opened_at=None):
         ticket_id, customer, subject = text(ticket_id, "ticket_id"), text(customer, "customer"), text(subject, "subject")
@@ -101,12 +106,14 @@ class SupportDesk(JsonStore):
         entry = data.get("knowledge", {}).get(article_id)
         if entry is None:
             raise ValueError("unknown knowledge article")
+        if not entry.get("enabled", True):
+            raise ValueError("knowledge article is disabled")
         if responded_at < ticket["opened_at"]:
             raise ValueError("responded_at must not be earlier than opened_at")
         ticket["first_response"] = {
             "message": entry["content"],
             "responded_at": responded_at,
-            "knowledge": dict(entry),
+            "knowledge": public_knowledge(entry),
         }
         self._write(data)
         return ticket
@@ -201,10 +208,10 @@ class SupportDesk(JsonStore):
         ticket = data.get("tickets", {}).get(ticket_id)
         if ticket is None or ticket["status"] != "closed":
             raise ValueError("source ticket must exist and be closed")
-        entry = {"article_id": article_id, "source_ticket_id": ticket_id, "title": ticket["subject"], "content": ticket["resolution"]}
+        entry = {"article_id": article_id, "source_ticket_id": ticket_id, "title": ticket["subject"], "content": ticket["resolution"], "enabled": True}
         data.setdefault("knowledge", {})[article_id] = entry
         self._write(data)
-        return entry
+        return public_knowledge(entry)
 
     def update_knowledge(self, article_id, title, content):
         article_id, title, content = (text(article_id, "article_id"),
@@ -217,7 +224,19 @@ class SupportDesk(JsonStore):
         entry["title"] = title
         entry["content"] = content
         self._write(data)
-        return entry
+        return public_knowledge(entry)
+
+    def set_knowledge_enabled(self, article_id, enabled):
+        article_id = text(article_id, "article_id")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        data = self._read()
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        entry["enabled"] = enabled
+        self._write(data)
+        return {"article": public_knowledge(entry), "enabled": enabled}
 
     def search_knowledge(self, query=None):
         if query is None:
@@ -226,7 +245,9 @@ class SupportDesk(JsonStore):
             raise ValueError("query must be a nonempty string")
         else:
             terms = [term.casefold() for term in query.strip().split()]
-        entries = sorted(self._read().get("knowledge", {}).values(), key=lambda entry: entry["article_id"])
+        entries = sorted((public_knowledge(entry) for entry in self._read().get("knowledge", {}).values()
+                          if entry.get("enabled", True)),
+                         key=lambda entry: entry["article_id"])
         if terms is None:
             return entries
         return [entry for entry in entries
