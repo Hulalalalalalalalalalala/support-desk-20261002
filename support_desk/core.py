@@ -3,6 +3,8 @@ from .storage import JsonStore, text, minute, positive
 PRIORITIES = ("urgent", "high", "normal", "low")
 PRIORITY_RANK = {name: index for index, name in enumerate(PRIORITIES)}
 
+_UNSET = object()
+
 class SupportDesk(JsonStore):
     def open_ticket(self, ticket_id, customer, subject, opened_at=None):
         ticket_id, customer, subject = text(ticket_id, "ticket_id"), text(customer, "customer"), text(subject, "subject")
@@ -422,3 +424,44 @@ class SupportDesk(JsonStore):
         else:
             matches = (t for t in tickets if t.get("category") == category)
         return sorted((t for t in matches if status is None or t["status"] == status), key=lambda t: t["ticket_id"])
+
+    def search_tickets(self, query, status=None, category=_UNSET, offset=0, limit=20):
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a nonempty string")
+        if status not in (None, "open", "closed"):
+            raise ValueError("status must be open or closed")
+        if category is not _UNSET and category is not None:
+            category = text(category, "category")
+        # bool is a subclass of int, so compare types explicitly; floats and strings are rejected too.
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        terms = [term.casefold() for term in query.strip().split()]
+        matched = []
+        for ticket in self._read().get("tickets", {}).values():
+            if status is not None and ticket["status"] != status:
+                continue
+            if category is _UNSET:
+                pass
+            elif category is None:
+                if ticket.get("category") is not None:
+                    continue
+            elif ticket.get("category") != category:
+                continue
+            fields = [ticket["customer"], ticket["subject"]]
+            fields.extend(ticket.get("notes") or [])
+            if ticket.get("resolution") is not None:
+                fields.append(ticket["resolution"])
+            response = ticket.get("first_response")
+            if response is not None and response.get("message"):
+                # Knowledge replies are searched by the saved message body, not the snapshot.
+                fields.append(response["message"])
+            for reply in ticket.get("replies") or []:
+                if reply.get("message"):
+                    fields.append(reply["message"])
+            haystacks = [field.casefold() for field in fields]
+            if all(any(term in haystack for haystack in haystacks) for term in terms):
+                matched.append(ticket)
+        matched.sort(key=lambda ticket: ticket["ticket_id"])
+        return {"total": len(matched), "items": matched[offset:offset + limit]}
