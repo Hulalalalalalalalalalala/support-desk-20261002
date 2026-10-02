@@ -87,6 +87,28 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
+    def respond_with_knowledge(self, ticket_id, article_id, responded_at):
+        ticket_id, article_id = text(ticket_id, "ticket_id"), text(article_id, "article_id")
+        responded_at = minute(responded_at, "responded_at")
+        data = self._read()
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] == "closed":
+            raise ValueError("ticket must exist and be open")
+        if "opened_at" not in ticket:
+            raise ValueError("ticket has no opened_at")
+        if ticket.get("first_response") is not None:
+            raise ValueError("ticket already has a first response")
+        if responded_at < ticket["opened_at"]:
+            raise ValueError("responded_at must not be earlier than opened_at")
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        knowledge = {"article_id": entry["article_id"], "source_ticket_id": entry["source_ticket_id"],
+                     "title": entry["title"], "content": entry["content"]}
+        ticket["first_response"] = {"message": entry["content"], "responded_at": responded_at, "knowledge": knowledge}
+        self._write(data)
+        return ticket
+
     def response_stats(self):
         tickets = list(self._read().get("tickets", {}).values())
         timed = [t for t in tickets if "opened_at" in t]
