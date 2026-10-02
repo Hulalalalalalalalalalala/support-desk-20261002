@@ -518,6 +518,48 @@ class SupportDesk(JsonStore):
         matched.sort(key=lambda item: item["ticket"]["ticket_id"])
         return {"total": len(matched), "items": matched[offset:offset + limit]}
 
+    def auto_assign(self, assignees, max_open=5):
+        if not isinstance(assignees, list) or not assignees:
+            raise ValueError("assignees must be a nonempty array")
+        names = []
+        for element in assignees:
+            if not isinstance(element, str) or not element.strip():
+                raise ValueError("assignees elements must be nonblank strings")
+            names.append(element.strip())
+        if len(set(names)) != len(names):
+            raise ValueError("assignees must not contain duplicate names")
+        max_open = positive(max_open, "max_open")
+        data = self._read()
+        tickets = data.get("tickets", {})
+        loads = {name: 0 for name in names}
+        for ticket in tickets.values():
+            if ticket["status"] == "open" and ticket.get("assignee") in loads:
+                loads[ticket["assignee"]] += 1
+        def candidate_key(ticket):
+            opened_at = ticket.get("opened_at")
+            return (PRIORITY_RANK[ticket.get("priority", "normal")],
+                    opened_at is None, opened_at if opened_at is not None else 0,
+                    ticket["ticket_id"])
+        candidates = sorted((ticket for ticket in tickets.values()
+                             if ticket["status"] == "open" and ticket.get("assignee") is None),
+                            key=candidate_key)
+        assigned = []
+        assigned_ids = set()
+        for ticket in candidates:
+            available = [name for name in names if loads[name] < max_open]
+            if not available:
+                break
+            chosen = min(available, key=lambda name: (loads[name], name))
+            ticket["assignee"] = chosen
+            loads[chosen] += 1
+            assigned.append(ticket)
+            assigned_ids.add(ticket["ticket_id"])
+        if assigned:
+            self._write(data)
+        remaining = [ticket["ticket_id"] for ticket in candidates
+                     if ticket["ticket_id"] not in assigned_ids]
+        return {"assigned": assigned, "remaining": remaining}
+
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")

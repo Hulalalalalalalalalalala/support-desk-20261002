@@ -2581,5 +2581,93 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(failed.stderr))
         self.assertFalse(missing.exists())
 
+    def test_auto_assign_balances_load_and_counts_immediately(self):
+        self.app.open_ticket("T-old", "Alice", "A", opened_at=1)
+        self.app.assign("T-old", "A")
+        self.app.open_ticket("T-1", "Bob", "B", opened_at=2)
+        self.app.open_ticket("T-2", "Cara", "C", opened_at=3)
+        result = self.app.auto_assign(["A", "B"], max_open=2)
+        self.assertEqual([t["ticket_id"] for t in result["assigned"]], ["T-1", "T-2"])
+        self.assertEqual([t["assignee"] for t in result["assigned"]], ["B", "A"])
+        self.assertEqual(result["remaining"], [])
+        again = SupportDesk(self.root).auto_assign(["A", "B"], max_open=2)
+        self.assertEqual(again, {"assigned": [], "remaining": []})
+
+    def test_auto_assign_orders_by_priority_time_and_id(self):
+        self.app.open_ticket("T-low", "A", "a", opened_at=1)
+        self.app.set_priority("T-low", "low")
+        self.app.open_ticket("T-untimed", "B", "b")
+        self.app.open_ticket("T-b", "C", "c", opened_at=5)
+        self.app.open_ticket("T-a", "D", "d", opened_at=5)
+        self.app.open_ticket("T-urgent", "E", "e", opened_at=9)
+        self.app.set_priority("T-urgent", "urgent")
+        result = self.app.auto_assign(["x"], max_open=10)
+        self.assertEqual([t["ticket_id"] for t in result["assigned"]],
+                         ["T-urgent", "T-a", "T-b", "T-untimed", "T-low"])
+
+    def test_auto_assign_skips_closed_and_assigned_and_counts_open_load(self):
+        self.app.open_ticket("T-closed", "A", "a")
+        self.app.assign("T-closed", "A")
+        self.app.close("T-closed", "Done")
+        self.app.open_ticket("T-taken", "B", "b")
+        self.app.assign("T-taken", "A")
+        self.app.open_ticket("T-open", "C", "c")
+        result = self.app.auto_assign(["A"], max_open=2)
+        self.assertEqual([t["ticket_id"] for t in result["assigned"]], ["T-open"])
+        # the closed ticket does not count, so one slot remains after T-taken
+        self.assertEqual(result["remaining"], [])
+
+    def test_auto_assign_no_capacity_returns_all_candidates_untouched(self):
+        self.app.open_ticket("T-taken", "A", "a")
+        self.app.assign("T-taken", "A")
+        self.app.open_ticket("T-waiting", "B", "b")
+        before = self.app.path.read_bytes()
+        result = self.app.auto_assign(["A"], max_open=1)
+        self.assertEqual(result, {"assigned": [], "remaining": ["T-waiting"]})
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_auto_assign_missing_root_returns_empty_without_creating(self):
+        missing = self.root / "missing"
+        result = SupportDesk(missing).auto_assign(["A"])
+        self.assertEqual(result, {"assigned": [], "remaining": []})
+        self.assertFalse(missing.exists())
+
+    def test_auto_assign_normalizes_names_and_rejects_bad_input(self):
+        self.app.open_ticket("T", "A", "a")
+        result = self.app.auto_assign(["  Ann  "])
+        self.assertEqual(result["assigned"][0]["assignee"], "Ann")
+        before = self.app.path.read_bytes()
+        for bad in (None, "Ann", [], {}, ["Ann", " Ann"], ["Ann", ""], [1], [None]):
+            with self.assertRaises(ValueError):
+                self.app.auto_assign(bad)
+        for bad_cap in (0, -1, True, 1.5, "2", None):
+            with self.assertRaises(ValueError):
+                self.app.auto_assign(["A"], bad_cap)
+        with self.assertRaises(TypeError):
+            self.app.auto_assign()
+        with self.assertRaises(TypeError):
+            self.app.auto_assign(["A"], unknown=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_cli_auto_assign(self):
+        self.app.open_ticket("T-1", "A", "a", opened_at=1)
+        payload = self.root / "input.json"
+        payload.write_text(json.dumps({"assignees": ["A", "B"], "max_open": 1}),
+                           encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "auto-assign", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([t["ticket_id"] for t in value["assigned"]], ["T-1"])
+        self.assertEqual(value["remaining"], [])
+        payload.write_text(json.dumps({"assignees": []}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "auto-assign", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
 if __name__ == "__main__":
     unittest.main()
