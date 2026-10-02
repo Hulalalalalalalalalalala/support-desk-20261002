@@ -232,6 +232,31 @@ class SupportDesk(JsonStore):
         return [entry for entry in entries
                 if all(term in entry["title"].casefold() or term in entry["content"].casefold() for term in terms)]
 
+    def set_category(self, ticket_id, category):
+        ticket_id = text(ticket_id, "ticket_id")
+        if category is not None:
+            category = text(category, "category")
+        data = self._read()
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] == "closed":
+            raise ValueError("ticket must exist and be open")
+        if category is None:
+            ticket.pop("category", None)
+        else:
+            ticket["category"] = category
+        self._write(data)
+        return ticket
+
+    def list_by_category(self, category, status=None):
+        if category is not None:
+            category = text(category, "category")
+        if status not in (None, "open", "closed"):
+            raise ValueError("status must be open or closed")
+        tickets = self._read().get("tickets", {}).values()
+        return sorted((t for t in tickets
+                       if t.get("category") == category and (status is None or t["status"] == status)),
+                      key=lambda t: t["ticket_id"])
+
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")
