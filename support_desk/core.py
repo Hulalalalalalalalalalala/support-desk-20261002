@@ -387,6 +387,56 @@ class SupportDesk(JsonStore):
                  "overdue": waiting > target_minutes}
                 for earliest, ticket, count, waiting in entries]
 
+    def customer_response_report(self, as_of):
+        as_of = minute(as_of, "as_of")
+        tickets = list(self._read().get("tickets", {}).values())
+        # Only tickets with a follow-up history participate; open and closed tickets alike.
+        participants = [ticket for ticket in tickets if ticket.get("customer_messages")]
+        answers = {}
+        for ticket in participants:
+            response = ticket.get("first_response")
+            # Missing, null or an empty object means there is no first response;
+            # handwritten and knowledge answers are collected the same way.
+            times = [response["responded_at"]] if isinstance(response, dict) and response else []
+            times.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
+            # Any follow-up or answer later than as_of invalidates the whole query.
+            if any(message["received_at"] > as_of for message in ticket["customer_messages"]) or \
+                    any(time > as_of for time in times):
+                raise ValueError("customer message or response time must not be later than as_of")
+            answers[ticket["ticket_id"]] = times
+        items = []
+        for ticket in participants:
+            ticket_id = ticket["ticket_id"]
+            for index, message in enumerate(ticket["customer_messages"]):
+                received_at = message["received_at"]
+                # Matching looks at time only: the earliest answer not earlier than
+                # the follow-up covers it, regardless of call order; the same answer
+                # may cover several follow-ups and equal times take zero minutes.
+                candidates = [time for time in answers[ticket_id] if time >= received_at]
+                if candidates:
+                    answered_at = min(candidates)
+                    items.append({"ticket_id": ticket_id, "index": index,
+                                  "received_at": received_at, "answered_at": answered_at,
+                                  "response_minutes": answered_at - received_at,
+                                  "outcome": "answered"})
+                else:
+                    outcome = "pending" if ticket["status"] != "closed" else "closed_without_answer"
+                    items.append({"ticket_id": ticket_id, "index": index,
+                                  "received_at": received_at, "answered_at": None,
+                                  "response_minutes": None, "outcome": outcome})
+        items.sort(key=lambda item: (item["received_at"], item["ticket_id"], item["index"]))
+        durations = [item["response_minutes"] for item in items if item["outcome"] == "answered"]
+        summary = {
+            "total": len(items),
+            "answered": sum(1 for item in items if item["outcome"] == "answered"),
+            "pending": sum(1 for item in items if item["outcome"] == "pending"),
+            "closed_without_answer": sum(1 for item in items
+                                         if item["outcome"] == "closed_without_answer"),
+            "average_minutes": sum(durations) / len(durations) if durations else None,
+            "max_minutes": max(durations) if durations else None,
+        }
+        return {"as_of": as_of, "summary": summary, "items": items}
+
     def response_target_report(self, as_of, targets=None):
         as_of = minute(as_of, "as_of")
         target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}

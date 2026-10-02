@@ -3093,5 +3093,205 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stderr))
 
+    def test_customer_response_report_matches_each_follow_up_independently(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q1", 10)
+        self.app.respond("T", "answer", 20)
+        self.app.receive("T", "q2", 20)   # same minute as the answer: zero minutes
+        self.app.receive("T", "q3", 30)
+        self.app.reply("T", "again", 40)
+        report = self.app.customer_response_report(100)
+        self.assertEqual(set(report), {"as_of", "summary", "items"})
+        self.assertEqual(report["as_of"], 100)
+        for item in report["items"]:
+            self.assertEqual(set(item), {"ticket_id", "index", "received_at", "answered_at",
+                                         "response_minutes", "outcome"})
+        self.assertEqual([(i["index"], i["received_at"], i["answered_at"],
+                           i["response_minutes"], i["outcome"]) for i in report["items"]],
+                         [(0, 10, 20, 10, "answered"),
+                          (1, 20, 20, 0, "answered"),
+                          (2, 30, 40, 10, "answered")])
+        self.assertEqual(report["summary"],
+                         {"total": 3, "answered": 3, "pending": 0,
+                          "closed_without_answer": 0, "average_minutes": 20 / 3,
+                          "max_minutes": 10})
+
+    def test_customer_response_report_one_answer_covers_several_follow_ups(self):
+        self._received_ticket("T", 0)
+        self.app.respond("T", "answer", 50)
+        self.app.receive("T", "a", 10)
+        self.app.receive("T", "b", 40)
+        # matching ignores call order: the single answer at 50 covers both follow-ups
+        report = self.app.customer_response_report(60)
+        self.assertEqual([(i["index"], i["answered_at"], i["response_minutes"])
+                          for i in report["items"]], [(0, 50, 40), (1, 50, 10)])
+
+    def test_customer_response_report_knowledge_answers_count_equally(self):
+        self._received_ticket("TK", 0)
+        self.app.open_ticket("TS", "A", "S", opened_at=0)
+        self.app.assign("TS", "Eve")
+        self.app.close("TS", "Done")
+        self.app.publish_knowledge("K", "TS")
+        self.app.respond_with_knowledge("TK", "K", 30)
+        self.app.receive("TK", "q", 30)
+        item = self.app.customer_response_report(40)["items"][0]
+        self.assertEqual((item["answered_at"], item["response_minutes"], item["outcome"]),
+                         (30, 0, "answered"))
+
+    def test_customer_response_report_pending_and_closed_without_answer(self):
+        self._received_ticket("T-open", 0)
+        self.app.receive("T-open", "q", 5)
+        self._received_ticket("T-closed", 0)
+        self.app.receive("T-closed", "q", 7)
+        self.app.assign("T-closed", "Eve")
+        self.app.close("T-closed", "Done")
+        # a closed ticket whose follow-up was answered stays answered
+        self._received_ticket("T-done", 0)
+        self.app.respond("T-done", "r", 4)
+        self.app.receive("T-done", "q", 4)
+        self.app.assign("T-done", "Fay")
+        self.app.close("T-done", "Done")
+        report = self.app.customer_response_report(20)
+        rows = {i["ticket_id"]: i for i in report["items"]}
+        self.assertEqual((rows["T-open"]["answered_at"], rows["T-open"]["response_minutes"],
+                          rows["T-open"]["outcome"]), (None, None, "pending"))
+        self.assertEqual((rows["T-closed"]["answered_at"], rows["T-closed"]["response_minutes"],
+                          rows["T-closed"]["outcome"]),
+                         (None, None, "closed_without_answer"))
+        self.assertEqual((rows["T-done"]["answered_at"], rows["T-done"]["response_minutes"],
+                          rows["T-done"]["outcome"]), (4, 0, "answered"))
+        self.assertEqual(report["summary"],
+                         {"total": 3, "answered": 1, "pending": 1,
+                          "closed_without_answer": 1, "average_minutes": 0.0,
+                          "max_minutes": 0})
+
+    def test_customer_response_report_null_and_empty_first_response_are_no_records(self):
+        self._received_ticket("T-null", 0)
+        self.app.receive("T-null", "q", 5)
+        self._received_ticket("T-empty", 0)
+        self.app.receive("T-empty", "q", 6)
+        data = self.app._read()
+        data["tickets"]["T-empty"]["first_response"] = {}
+        data["tickets"]["T-null"]["replies"] = []
+        self.app._write(data)
+        report = self.app.customer_response_report(10)
+        self.assertEqual({i["ticket_id"] for i in report["items"]}, {"T-null", "T-empty"})
+        self.assertTrue(all(i["outcome"] == "pending" and i["answered_at"] is None
+                            for i in report["items"]))
+        self.assertTrue(all(i["response_minutes"] is None for i in report["items"]))
+
+    def test_customer_response_report_excludes_historyless_and_counts_duplicates(self):
+        self._received_ticket("T-historyless", 0)
+        self.app.respond("T-historyless", "r", 5)
+        self._received_ticket("T-dup", 0)
+        self.app.receive("T-dup", "same", 10)
+        self.app.receive("T-dup", "same", 10)  # duplicate record is counted independently
+        report = self.app.customer_response_report(20)
+        self.assertEqual([(i["ticket_id"], i["index"]) for i in report["items"]],
+                         [("T-dup", 0), ("T-dup", 1)])
+        self.assertEqual(report["summary"]["total"], 2)
+
+    def test_customer_response_report_sorts_by_time_then_case_sensitive_id_then_index(self):
+        self._received_ticket("Tb", 0)
+        self.app.receive("Tb", "q", 10)
+        self._received_ticket("Ta", 0)
+        self.app.receive("Ta", "q", 10)
+        self._received_ticket("T-early", 0)
+        self.app.receive("T-early", "q0", 5)
+        self.app.receive("T-early", "q1", 5)
+        report = self.app.customer_response_report(20)
+        self.assertEqual([(i["ticket_id"], i["index"]) for i in report["items"]],
+                         [("T-early", 0), ("T-early", 1), ("Ta", 0), ("Tb", 0)])
+
+    def test_customer_response_report_raises_if_any_record_later_than_as_of(self):
+        self._received_ticket("T-msg", 0)
+        self.app.respond("T-msg", "r", 5)
+        self.app.receive("T-msg", "q", 40)
+        self._received_ticket("T-ans", 0)
+        self.app.receive("T-ans", "q", 5)
+        self.app.respond("T-ans", "r", 40)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.customer_response_report(30)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # a closed participating ticket with a future follow-up still raises
+        self.app.assign("T-msg", "Eve")
+        self.app.close("T-msg", "Done")
+        with self.assertRaises(ValueError):
+            self.app.customer_response_report(30)
+        # follow-up histories removed: both tickets stop participating, so their
+        # future answer/follow-up records no longer invalidate the query
+        data = self.app._read()
+        data["tickets"]["T-msg"]["customer_messages"] = []
+        data["tickets"]["T-ans"]["customer_messages"] = []
+        self.app._write(data)
+        self.assertEqual(self.app.customer_response_report(30)["items"], [])
+
+    def test_customer_response_report_close_and_reopen_classify_by_current_state(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q", 5)
+        self.app.assign("T", "Eve")
+        self.app.close("T", "Done")
+        self.assertEqual(self.app.customer_response_report(10)["items"][0]["outcome"],
+                         "closed_without_answer")
+        self.app.reopen_ticket("T", "back")
+        self.assertEqual(self.app.customer_response_report(10)["items"][0]["outcome"], "pending")
+        self.app.respond("T", "answer", 10)
+        self.assertEqual(self.app.customer_response_report(10)["items"][0]["outcome"], "answered")
+
+    def test_customer_response_report_bad_arguments_and_empty_directory(self):
+        for as_of in (True, False, 1.5, "40", None, -1):
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.customer_response_report(as_of)
+        with self.assertRaises(TypeError):
+            self.app.customer_response_report()
+        with self.assertRaises(TypeError):
+            self.app.customer_response_report(40, bogus=1)
+        empty = {"as_of": 0,
+                 "summary": {"total": 0, "answered": 0, "pending": 0,
+                             "closed_without_answer": 0, "average_minutes": None,
+                             "max_minutes": None},
+                 "items": []}
+        self.assertEqual(self.app.customer_response_report(0), empty)
+        self.assertFalse(self.app.path.exists())
+        missing = self.root / "missing"
+        self.assertEqual(SupportDesk(missing).customer_response_report(0), empty)
+        self.assertFalse(missing.exists())
+
+    def test_customer_response_report_is_read_only(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q", 5)
+        before = self.app.path.read_bytes()
+        self.app.customer_response_report(10)
+        self.assertEqual(before, self.app.path.read_bytes())
+        with self.assertRaises(ValueError):
+            self.app.customer_response_report(2)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_cli_customer_response_report(self):
+        self._received_ticket("T-1", 0)
+        self.app.receive("T-1", "q", 10)
+        self.app.respond("T-1", "answer", 25)
+        query = self.root / "report.json"
+        query.write_text(json.dumps({"as_of": 30}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "customer-response-report", str(query)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["as_of"], 30)
+        self.assertEqual([(i["ticket_id"], i["index"], i["answered_at"], i["response_minutes"],
+                           i["outcome"]) for i in value["items"]],
+                         [("T-1", 0, 25, 15, "answered")])
+        self.assertEqual(value["summary"]["total"], 1)
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"as_of": -1}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "customer-response-report", str(bad)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
 if __name__ == "__main__":
     unittest.main()
