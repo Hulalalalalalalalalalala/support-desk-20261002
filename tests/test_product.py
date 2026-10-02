@@ -1104,5 +1104,230 @@ class ProductTests(unittest.TestCase):
         self.assertEqual([h["content"] for h in SupportDesk(self.root).knowledge_history("KB-1")],
                          ["Sent link", "Second", "Sent link", "Second"])
 
+class FollowupReplyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = SupportDesk(self.root)
+
+    def _responded_ticket(self, ticket_id="T", opened_at=5, responded_at=6):
+        self.app.open_ticket(ticket_id, "Alice", "Need download", opened_at=opened_at)
+        self.app.respond(ticket_id, "On it", responded_at)
+        return ticket_id
+
+    def _knowledge_article(self, article_id="KB-1", content="Sent link"):
+        self.app.open_ticket("T-src", "Bob", "Download")
+        self.app.assign("T-src", "Cara")
+        self.app.close("T-src", content)
+        return self.app.publish_knowledge(article_id, "T-src")
+
+    def test_reply_persists_and_keeps_other_fields(self):
+        ticket_id = self._responded_ticket()
+        self.app.assign(ticket_id, "Dan")
+        self.app.note(ticket_id, "Checked")
+        ticket = self.app.reply(" T ", "  Still working\non it.  ", 8)
+        self.assertEqual(ticket["replies"], [{"message": "Still working\non it.", "replied_at": 8}])
+        self.assertEqual((ticket["status"], ticket["assignee"], ticket["notes"], ticket["resolution"]),
+                         ("open", "Dan", ["Checked"], None))
+        self.assertEqual(ticket["first_response"], {"message": "On it", "responded_at": 6})
+        reloaded = SupportDesk(self.root).get("T")
+        self.assertEqual(reloaded["replies"], [{"message": "Still working\non it.", "replied_at": 8}])
+
+    def test_reply_allows_same_minute_and_duplicate_records(self):
+        self._responded_ticket(opened_at=6, responded_at=6)
+        first = self.app.reply("T", "again", 6)
+        self.assertEqual(first["replies"], [{"message": "again", "replied_at": 6}])
+        second = self.app.reply("T", "again", 6)
+        self.assertEqual(second["replies"],
+                         [{"message": "again", "replied_at": 6}, {"message": "again", "replied_at": 6}])
+
+    def test_reply_enforces_ordering_against_first_response_and_last_reply(self):
+        self._responded_ticket(opened_at=5, responded_at=6)
+        self.app.reply("T", "later", 10)
+        for replied_at in (5, 9):
+            with self.assertRaises(ValueError, msg=replied_at):
+                self.app.reply("T", "back", replied_at)
+        ticket = self.app.reply("T", "same minute", 10)
+        self.assertEqual([r["replied_at"] for r in ticket["replies"]], [10, 10])
+
+    def test_reply_with_knowledge_saves_four_field_snapshot(self):
+        entry = self._knowledge_article()
+        self._responded_ticket()
+        ticket = self.app.reply_with_knowledge(" T ", "KB-1", 7)
+        self.assertEqual(ticket["replies"],
+                         [{"message": "Sent link", "replied_at": 7, "knowledge": dict(entry)}])
+        # mixed with manual replies, ordering applies to both
+        ticket = self.app.reply("T", "manual", 8)
+        ticket = self.app.reply_with_knowledge("T", "KB-1", 8)
+        self.assertEqual([r["replied_at"] for r in ticket["replies"]], [7, 8, 8])
+        self.assertEqual(set(ticket["replies"][0]), {"message", "replied_at", "knowledge"})
+        self.assertEqual(set(ticket["replies"][1]), {"message", "replied_at"})
+        reloaded = SupportDesk(self.root).get("T")
+        self.assertEqual(reloaded["replies"][2]["knowledge"], dict(entry))
+
+    def test_revisions_and_disabling_keep_saved_replies(self):
+        self._knowledge_article()
+        self._responded_ticket()
+        self.app.reply_with_knowledge("T", "KB-1", 7)
+        self.app.update_knowledge("KB-1", "Download", "New link")
+        self.app.set_knowledge_enabled("KB-1", False)
+        saved = SupportDesk(self.root).get("T")["replies"][0]
+        self.assertEqual(saved["message"], "Sent link")
+        self.assertEqual(saved["knowledge"]["content"], "Sent link")
+        with self.assertRaises(ValueError):
+            self.app.reply_with_knowledge("T", "KB-1", 8)
+        self.app.set_knowledge_enabled("KB-1", True)
+        ticket = self.app.reply_with_knowledge("T", "KB-1", 8)
+        self.assertEqual(ticket["replies"][-1]["message"], "New link")
+
+    def test_reply_requires_existing_open_timed_responded_ticket(self):
+        self._responded_ticket("T-ok")
+        self.app.open_ticket("T-untimed", "Bob", "No clock")
+        self.app.open_ticket("T-pending", "Cara", "Waiting", opened_at=5)
+        self.app.open_ticket("T-closed", "Dan", "Done", opened_at=5)
+        self.app.respond("T-closed", "Seen", 6)
+        self.app.assign("T-closed", "Eve")
+        self.app.close("T-closed", "Fixed")
+        before = self.app.path.read_bytes()
+        for method, kwargs in [
+            (self.app.reply, {"ticket_id": "missing", "message": "m", "replied_at": 7}),
+            (self.app.reply, {"ticket_id": "T-untimed", "message": "m", "replied_at": 7}),
+            (self.app.reply, {"ticket_id": "T-pending", "message": "m", "replied_at": 7}),
+            (self.app.reply, {"ticket_id": "T-closed", "message": "m", "replied_at": 7}),
+            (self.app.reply_with_knowledge, {"ticket_id": "T-untimed", "article_id": "KB-1", "replied_at": 7}),
+            (self.app.reply_with_knowledge, {"ticket_id": "T-pending", "article_id": "KB-1", "replied_at": 7}),
+            (self.app.reply_with_knowledge, {"ticket_id": "T-closed", "article_id": "KB-1", "replied_at": 7}),
+        ]:
+            with self.assertRaises(ValueError, msg=kwargs):
+                method(**kwargs)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_reply_rejects_bad_input_without_writing(self):
+        self._knowledge_article()
+        self._responded_ticket()
+        before = self.app.path.read_bytes()
+        for ticket_id, message, replied_at in [
+            (None, "m", 8), (1, "m", 8), (" ", "m", 8),
+            ("T", None, 8), ("T", 1, 8), ("T", " ", 8),
+            ("T", "m", True), ("T", "m", 1.5), ("T", "m", "8"),
+            ("T", "m", None), ("T", "m", -1), ("T", "m", 5),
+        ]:
+            with self.assertRaises(ValueError, msg=(ticket_id, message, replied_at)):
+                self.app.reply(ticket_id, message, replied_at)
+        for ticket_id, article_id, replied_at in [
+            (None, "KB-1", 8), (" ", "KB-1", 8), ("T", None, 8), ("T", 1, 8),
+            ("T", "kb-1", 8), ("T", "KB-X", 8), ("T", "KB-1", True),
+            ("T", "KB-1", 1.5), ("T", "KB-1", "8"), ("T", "KB-1", None),
+            ("T", "KB-1", -1), ("T", "KB-1", 5),
+        ]:
+            with self.assertRaises(ValueError, msg=(ticket_id, article_id, replied_at)):
+                self.app.reply_with_knowledge(ticket_id, article_id, replied_at)
+        with self.assertRaises(TypeError):
+            self.app.reply("T", "m")
+        with self.assertRaises(TypeError):
+            self.app.reply("T", "m", 8, "extra")
+        with self.assertRaises(TypeError):
+            self.app.reply_with_knowledge("T", "KB-1")
+        with self.assertRaises(TypeError):
+            self.app.reply_with_knowledge("T", "KB-1", 8, "extra")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertNotIn("replies", self.app.get("T"))
+
+    def test_reply_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.reply("T", "m", 3)
+        with self.assertRaises(ValueError):
+            app.reply_with_knowledge("T", "KB-1", 3)
+        self.assertFalse(fresh.exists())
+
+    def test_legacy_ticket_gains_replies_only_on_first_success(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir()
+        (legacy / "data.json").write_text(json.dumps({"tickets": {
+            "OLD": {"ticket_id": "OLD", "customer": "甲", "subject": "s", "status": "open",
+                    "assignee": None, "notes": [], "resolution": None, "opened_at": 3,
+                    "first_response": {"message": "hi", "responded_at": 4}}}}, ensure_ascii=False),
+            encoding="utf-8")
+        app = SupportDesk(legacy)
+        self.assertNotIn("replies", app.get("OLD"))
+        # reads do not backfill the missing field
+        app.priority_queue()
+        stored = json.loads((legacy / "data.json").read_text(encoding="utf-8"))
+        self.assertNotIn("replies", stored["tickets"]["OLD"])
+        ticket = app.reply("OLD", "again", 5)
+        self.assertEqual(ticket["replies"], [{"message": "again", "replied_at": 5}])
+        self.assertEqual(SupportDesk(legacy).get("OLD")["replies"],
+                         [{"message": "again", "replied_at": 5}])
+
+    def test_close_reopen_keeps_replies_and_time_order(self):
+        self._responded_ticket(opened_at=5, responded_at=6)
+        self.app.reply("T", "one", 7)
+        self.app.assign("T", "Dan")
+        self.app.close("T", "Fixed")
+        with self.assertRaises(ValueError):
+            self.app.reply("T", "while closed", 8)
+        ticket = self.app.reopen_ticket("T", "recurred")
+        self.assertEqual(ticket["replies"], [{"message": "one", "replied_at": 7}])
+        with self.assertRaises(ValueError):
+            self.app.reply("T", "back", 6)
+        ticket = self.app.reply("T", "same minute", 7)
+        ticket = self.app.reply("T", "two", 8)
+        self.assertEqual([r["replied_at"] for r in ticket["replies"]], [7, 7, 8])
+
+    def test_replies_do_not_change_stats_and_queues(self):
+        self._knowledge_article()
+        self._responded_ticket()
+        self.app.reply("T", "one", 7)
+        self.app.reply_with_knowledge("T", "KB-1", 8)
+        stats = self.app.response_stats()
+        self.assertEqual((stats["timed"], stats["responded"], stats["pending"]), (1, 1, 0))
+        self.assertEqual(self.app.response_queue(10)["items"], [])
+        self.assertEqual([i["ticket"]["ticket_id"] for i in self.app.priority_queue()], ["T"])
+
+    def test_cli_reply_and_knowledge_reply(self):
+        self._knowledge_article()
+        self._responded_ticket()
+        payload = self.root / "reply.json"
+        payload.write_text(json.dumps({"ticket_id": " T ", "message": " 多行\n正文 ", "replied_at": 7}),
+                           encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "reply", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["replies"],
+                         [{"message": "多行\n正文", "replied_at": 7}])
+        kpayload = self.root / "kreply.json"
+        kpayload.write_text(json.dumps({"ticket_id": "T", "article_id": "KB-1", "replied_at": 7}),
+                            encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "knowledge-reply", str(kpayload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["replies"][-1]["knowledge"]["article_id"], "KB-1")
+        # failures print stderr JSON, exit 2, empty stdout
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"ticket_id": "T", "message": "late", "replied_at": 6}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "reply", str(bad)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(failed.stdout, "")
+        # batch stops at the first error and keeps earlier successes
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"ticket_id": "T", "message": "batch-1", "replied_at": 9},
+            {"ticket_id": "missing", "message": "fails", "replied_at": 10},
+            {"ticket_id": "T", "message": "never runs", "replied_at": 11},
+        ]), encoding="utf-8")
+        failed_batch = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                       "reply", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed_batch.returncode, 2)
+        self.assertIn("error", json.loads(failed_batch.stderr))
+        self.assertEqual(failed_batch.stdout, "")
+        replies = SupportDesk(self.root).get("T")["replies"]
+        self.assertEqual([r["replied_at"] for r in replies], [7, 7, 9])
+
 if __name__ == "__main__":
     unittest.main()

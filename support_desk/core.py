@@ -124,6 +124,50 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
+    def _followup_state(self, data, ticket_id, replied_at):
+        ticket = data.get("tickets", {}).get(ticket_id)
+        if ticket is None or ticket["status"] == "closed":
+            raise ValueError("ticket must exist and be open")
+        if "opened_at" not in ticket:
+            raise ValueError("ticket has no opened_at")
+        if ticket.get("first_response") is None:
+            raise ValueError("ticket has no first response")
+        replies = ticket.get("replies")
+        previous = replies[-1]["replied_at"] if replies else ticket["first_response"]["responded_at"]
+        if replied_at < previous:
+            raise ValueError("replied_at must not be earlier than the previous response")
+        return ticket, replies
+
+    def _save_reply(self, data, ticket, replies, record):
+        # Old tickets without a replies array start empty; the field is born on the first append.
+        if replies is None:
+            ticket["replies"] = [record]
+        else:
+            replies.append(record)
+        self._write(data)
+        return ticket
+
+    def reply(self, ticket_id, message, replied_at):
+        ticket_id, message = text(ticket_id, "ticket_id"), text(message, "message")
+        replied_at = minute(replied_at, "replied_at")
+        data = self._read()
+        ticket, replies = self._followup_state(data, ticket_id, replied_at)
+        return self._save_reply(data, ticket, replies,
+                                {"message": message, "replied_at": replied_at})
+
+    def reply_with_knowledge(self, ticket_id, article_id, replied_at):
+        ticket_id, article_id = text(ticket_id, "ticket_id"), text(article_id, "article_id")
+        replied_at = minute(replied_at, "replied_at")
+        data = self._read()
+        ticket, replies = self._followup_state(data, ticket_id, replied_at)
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        if not data.get("knowledge_enabled", {}).get(article_id, True):
+            raise ValueError("knowledge article is disabled")
+        record = {"message": entry["content"], "replied_at": replied_at, "knowledge": dict(entry)}
+        return self._save_reply(data, ticket, replies, record)
+
     def response_stats(self):
         tickets = list(self._read().get("tickets", {}).values())
         timed = [t for t in tickets if "opened_at" in t]
