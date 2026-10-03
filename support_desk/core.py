@@ -13,11 +13,13 @@ class _Edge:
         self.to, self.rev, self.cap = to, rev, cap
 
 
-def _route_coverage(candidates, rule_by_category, loads, max_open):
+def _route_coverage(candidates, rule_by_category, loads, limits):
     # Choose a globally feasible plan maximizing the number of assigned tickets.
     # Residual flow decides feasibility of each tentative decision; rerouting
     # through reverse edges lets an earlier ticket keep an undecided recipient.
-    capacities = {name: max_open - load for name, load in loads.items() if load < max_open}
+    # limits maps every name in loads to its personal open-ticket ceiling.
+    capacities = {name: limits[name] - load for name, load in loads.items()
+                  if load < limits[name]}
     options = []
     for ticket in candidates:
         names = rule_by_category.get(ticket.get("category"))
@@ -1089,7 +1091,7 @@ class SupportDesk(JsonStore):
                      if ticket["ticket_id"] not in assigned_ids]
         return {"assigned": assigned, "remaining": remaining}
 
-    def route_assign(self, rules, max_open=5, strategy="greedy"):
+    def route_assign(self, rules, max_open=5, strategy="greedy", assignee_limits=None):
         if strategy not in ("greedy", "coverage"):
             raise ValueError("strategy must be greedy or coverage")
         if not isinstance(rules, list) or not rules:
@@ -1119,6 +1121,27 @@ class SupportDesk(JsonStore):
                 raise ValueError("assignees must not contain duplicate names")
             normalized.append((category, names))
         max_open = positive(max_open, "max_open")
+        known_names = {name for _, names in normalized for name in names}
+        # Per-person ceilings for this call only; omitted, null or an empty
+        # object means everyone shares max_open. Names strip outer whitespace,
+        # stay case-sensitive and must appear in this call's rules.
+        limits = {}
+        if assignee_limits is not None:
+            if not isinstance(assignee_limits, dict):
+                raise ValueError("assignee_limits must be an object or null")
+            for raw_name, value in assignee_limits.items():
+                if not isinstance(raw_name, str) or not raw_name.strip():
+                    raise ValueError("assignee_limits names must be nonblank strings")
+                name = raw_name.strip()
+                if name in limits:
+                    raise ValueError("assignee_limits must not contain duplicate names")
+                if name not in known_names:
+                    raise ValueError("assignee_limits has an unknown assignee: " + name)
+                # bool is a subclass of int, so compare types explicitly; floats,
+                # strings, null and negative values are rejected too.
+                if type(value) is not int or value < 0:
+                    raise ValueError("assignee_limits." + name + " must be a nonnegative integer")
+                limits[name] = value
         data = self._read()
         tickets = data.get("tickets", {})
         rule_by_category = {category: names for category, names in normalized}
@@ -1148,7 +1171,7 @@ class SupportDesk(JsonStore):
                 names = rule_by_category.get(ticket.get("category"))
                 if names is None:
                     continue
-                available = [name for name in names if loads[name] < max_open]
+                available = [name for name in names if loads[name] < limits.get(name, max_open)]
                 if not available:
                     continue
                 chosen = min(available, key=lambda name: (loads[name], name))
@@ -1160,7 +1183,8 @@ class SupportDesk(JsonStore):
             # Pick the global plan with the most assignments; ties prefer
             # assigning the earlier candidate, then the lexicographically
             # smallest recipient sequence in candidate order.
-            choices = _route_coverage(candidates, rule_by_category, loads, max_open)
+            ceilings = {name: limits.get(name, max_open) for name in loads}
+            choices = _route_coverage(candidates, rule_by_category, loads, ceilings)
             for ticket, chosen in zip(candidates, choices):
                 if chosen is None:
                     continue
