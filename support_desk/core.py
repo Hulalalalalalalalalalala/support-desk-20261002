@@ -704,7 +704,8 @@ class SupportDesk(JsonStore):
         }
         return {"as_of": as_of, "summary": summary, "items": items}
 
-    def response_target_report(self, as_of, targets=None, since=None, until=None):
+    def response_target_report(self, as_of, targets=None, since=None, until=None,
+                               service_periods=None):
         as_of = minute(as_of, "as_of")
         target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
         if targets is not None:
@@ -720,6 +721,36 @@ class SupportDesk(JsonStore):
             until = minute(until, "until")
         if since is not None and until is not None and until < since:
             raise ValueError("until must not be earlier than since")
+        periods = None
+        if service_periods is not None:
+            if not isinstance(service_periods, list):
+                raise ValueError("service_periods must be an array or null")
+            spans = []
+            for period in service_periods:
+                if not isinstance(period, (list, tuple)) or len(period) != 2:
+                    raise ValueError("service_periods entries must be [start, end] pairs")
+                start = minute(period[0], "service_periods start")
+                end = minute(period[1], "service_periods end")
+                if start >= end:
+                    raise ValueError("service_periods start must be earlier than end")
+                spans.append((start, end))
+            # Merge into disjoint half-open intervals so overlapping, duplicate
+            # or touching periods cover each minute only once; order is irrelevant.
+            periods = []
+            for start, end in sorted(spans):
+                if periods and start <= periods[-1][1]:
+                    periods[-1][1] = max(periods[-1][1], end)
+                else:
+                    periods.append([start, end])
+
+        def elapsed(start, end):
+            # Minutes of [start, end) covered by the service periods; without
+            # periods (null or omitted) every natural minute counts.
+            if periods is None:
+                return end - start
+            return sum(max(0, min(span_end, end) - max(span_start, start))
+                       for span_start, span_end in periods)
+
         tickets = list(self._read().get("tickets", {}).values())
         if since is None and until is None:
             # No window: every ticket takes part, untimed ones included.
@@ -759,7 +790,7 @@ class SupportDesk(JsonStore):
                 # open tickets are pending, closed ones closed_without_response.
                 if isinstance(response, dict) and response:
                     counts["responded"] += 1
-                    if response["responded_at"] - ticket["opened_at"] <= target:
+                    if elapsed(ticket["opened_at"], response["responded_at"]) <= target:
                         counts["on_time"] += 1
                     else:
                         counts["late"] += 1
@@ -767,7 +798,7 @@ class SupportDesk(JsonStore):
                     counts["closed_without_response"] += 1
                 else:
                     counts["pending"] += 1
-                    if as_of - ticket["opened_at"] > target:
+                    if elapsed(ticket["opened_at"], as_of) > target:
                         counts["overdue"] += 1
             rate = counts["on_time"] / counts["responded"] if counts["responded"] else None
             groups.append({"priority": priority, "target_minutes": target, **counts, "on_time_rate": rate})
