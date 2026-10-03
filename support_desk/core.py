@@ -926,7 +926,50 @@ class SupportDesk(JsonStore):
                      if ticket["ticket_id"] not in assigned_ids]
         return {"assigned": assigned, "remaining": remaining}
 
-    def route_assign(self, rules, max_open=5):
+    def _coverage_plan(self, candidates, rule_by_category, loads, max_open):
+        # Explore every plan and keep the best by: most assignments, then the
+        # per-candidate assigned indicator (an assigned ticket wins at the first
+        # differing position), then the case-sensitive lexicographically smallest
+        # receiver name sequence. The total order makes rule and assignee input
+        # order irrelevant.
+        options = []
+        for ticket in candidates:
+            names = rule_by_category.get(ticket.get("category"))
+            options.append(sorted(names) if names else [])
+        suffix = [0] * (len(candidates) + 1)
+        for index in range(len(candidates) - 1, -1, -1):
+            suffix[index] = suffix[index + 1] + (1 if options[index] else 0)
+        plan = [None] * len(candidates)
+        current = dict(loads)
+        best = {"info": None, "plan": None}
+        def search(index, count):
+            if best["info"] is not None and count + suffix[index] < best["info"][0]:
+                return
+            if index == len(candidates):
+                indicator = tuple(choice is not None for choice in plan)
+                names = tuple(choice for choice in plan if choice is not None)
+                info = best["info"]
+                if (info is None or count > info[0]
+                        or (count == info[0] and (indicator > info[1]
+                            or (indicator == info[1] and names < info[2])))):
+                    best["info"] = (count, indicator, names)
+                    best["plan"] = list(plan)
+                return
+            # Try assigning before skipping so strong plans prune the rest early.
+            for name in options[index]:
+                if current[name] < max_open:
+                    plan[index] = name
+                    current[name] += 1
+                    search(index + 1, count + 1)
+                    current[name] -= 1
+                    plan[index] = None
+            search(index + 1, count)
+        search(0, 0)
+        return best["plan"]
+
+    def route_assign(self, rules, max_open=5, strategy="greedy"):
+        if strategy not in ("greedy", "coverage"):
+            raise ValueError("strategy must be greedy or coverage")
         if not isinstance(rules, list) or not rules:
             raise ValueError("rules must be a nonempty array")
         normalized = []
@@ -976,20 +1019,29 @@ class SupportDesk(JsonStore):
                             key=candidate_key)
         assigned = []
         assigned_ids = set()
-        for ticket in candidates:
-            # Each ticket uses only the rule for its exact category; the
-            # uncategorized rule never backstops a categorized ticket.
-            names = rule_by_category.get(ticket.get("category"))
-            if names is None:
-                continue
-            available = [name for name in names if loads[name] < max_open]
-            if not available:
-                continue
-            chosen = min(available, key=lambda name: (loads[name], name))
-            ticket["assignee"] = chosen
-            loads[chosen] += 1
-            assigned.append(ticket)
-            assigned_ids.add(ticket["ticket_id"])
+        if strategy == "coverage":
+            plan = self._coverage_plan(candidates, rule_by_category, loads, max_open)
+            for ticket, chosen in zip(candidates, plan):
+                if chosen is None:
+                    continue
+                ticket["assignee"] = chosen
+                assigned.append(ticket)
+                assigned_ids.add(ticket["ticket_id"])
+        else:
+            for ticket in candidates:
+                # Each ticket uses only the rule for its exact category; the
+                # uncategorized rule never backstops a categorized ticket.
+                names = rule_by_category.get(ticket.get("category"))
+                if names is None:
+                    continue
+                available = [name for name in names if loads[name] < max_open]
+                if not available:
+                    continue
+                chosen = min(available, key=lambda name: (loads[name], name))
+                ticket["assignee"] = chosen
+                loads[chosen] += 1
+                assigned.append(ticket)
+                assigned_ids.add(ticket["ticket_id"])
         if assigned:
             self._write(data)
         remaining = [ticket["ticket_id"] for ticket in candidates
