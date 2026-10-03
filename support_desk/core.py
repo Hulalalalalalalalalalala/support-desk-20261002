@@ -305,6 +305,23 @@ class SupportDesk(JsonStore):
         message = text(message, "message")
         return self._change(ticket_id, lambda t: t["notes"].append(message))
 
+    @staticmethod
+    def _earlier_close_times(ticket):
+        # Times a closure must not be earlier than; histories missing on old
+        # tickets count as no records and are never backfilled.
+        earlier = []
+        if "opened_at" in ticket:
+            earlier.append(ticket["opened_at"])
+        response = ticket.get("first_response")
+        if isinstance(response, dict) and response.get("responded_at") is not None:
+            earlier.append(response["responded_at"])
+        earlier.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
+        earlier.extend(message["received_at"] for message in ticket.get("customer_messages") or [])
+        earlier.extend(entry["transferred_at"] for entry in ticket.get("transfer_history") or [])
+        earlier.extend(entry["closed_at"] for entry in ticket.get("reopen_history") or []
+                       if "closed_at" in entry)
+        return earlier
+
     def close(self, ticket_id, resolution, closed_at=None):
         resolution = text(resolution, "resolution")
         if closed_at is not None:
@@ -313,23 +330,54 @@ class SupportDesk(JsonStore):
             if not ticket["assignee"]:
                 raise ValueError("assign the ticket before closing")
             if closed_at is not None:
-                earlier = []
-                if "opened_at" in ticket:
-                    earlier.append(ticket["opened_at"])
-                response = ticket.get("first_response")
-                if isinstance(response, dict) and response.get("responded_at") is not None:
-                    earlier.append(response["responded_at"])
-                earlier.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
-                earlier.extend(message["received_at"] for message in ticket.get("customer_messages") or [])
-                earlier.extend(entry["transferred_at"] for entry in ticket.get("transfer_history") or [])
-                earlier.extend(entry["closed_at"] for entry in ticket.get("reopen_history") or []
-                               if "closed_at" in entry)
+                earlier = self._earlier_close_times(ticket)
                 if earlier and closed_at < max(earlier):
                     raise ValueError("closed_at must not be earlier than existing ticket times")
             ticket.update(status="closed", resolution=resolution)
             if closed_at is not None:
                 ticket["closed_at"] = closed_at
         return self._change(ticket_id, apply)
+
+    def close_many(self, items):
+        if not isinstance(items, list) or not items:
+            raise ValueError("items must be a nonempty array")
+        normalized = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict) or not {"ticket_id", "resolution"} <= set(item) \
+                    or not set(item) <= {"ticket_id", "resolution", "closed_at"}:
+                raise ValueError("each item must contain only ticket_id, resolution and optional closed_at")
+            ticket_id = text(item["ticket_id"], "ticket_id")
+            resolution = text(item["resolution"], "resolution")
+            closed_at = item.get("closed_at")
+            if closed_at is not None:
+                closed_at = minute(closed_at, "closed_at")
+            if ticket_id in seen:
+                raise ValueError("items must not contain duplicate ticket ids")
+            seen.add(ticket_id)
+            normalized.append((ticket_id, resolution, closed_at))
+        data = self._read()
+        tickets = data.get("tickets", {})
+        targets = []
+        # Validate every selected ticket before mutating any, so a rejected
+        # batch leaves all tickets open and writes no directory or file.
+        for ticket_id, resolution, closed_at in normalized:
+            ticket = tickets.get(ticket_id)
+            if ticket is None or ticket["status"] != "open" or not ticket.get("assignee"):
+                raise ValueError("ticket must exist, be open and assigned")
+            if closed_at is not None:
+                earlier = self._earlier_close_times(ticket)
+                if earlier and closed_at < max(earlier):
+                    raise ValueError("closed_at must not be earlier than existing ticket times")
+            targets.append((ticket, resolution, closed_at))
+        closed = []
+        for ticket, resolution, closed_at in targets:
+            ticket.update(status="closed", resolution=resolution)
+            if closed_at is not None:
+                ticket["closed_at"] = closed_at
+            closed.append(ticket)
+        self._write(data)
+        return closed
 
     def reopen_ticket(self, ticket_id, reason):
         ticket_id, reason = text(ticket_id, "ticket_id"), text(reason, "reason")
