@@ -378,7 +378,10 @@ class SupportDesk(JsonStore):
             raise ValueError("ticket must exist and be open")
         if "opened_at" not in ticket:
             raise ValueError("ticket has no opened_at")
-        if ticket.get("first_response") is not None:
+        response = ticket.get("first_response")
+        # Missing, null or an empty object means the ticket still awaits its
+        # first response; only a non-empty object blocks a new registration.
+        if isinstance(response, dict) and response:
             raise ValueError("ticket already has a first response")
         if responded_at < ticket["opened_at"]:
             raise ValueError("responded_at must not be earlier than opened_at")
@@ -419,7 +422,10 @@ class SupportDesk(JsonStore):
             raise ValueError("ticket must exist and be open")
         if "opened_at" not in ticket:
             raise ValueError("ticket has no opened_at")
-        if ticket.get("first_response") is not None:
+        response = ticket.get("first_response")
+        # Missing, null or an empty object means the ticket still awaits its
+        # first response; only a non-empty object blocks a new registration.
+        if isinstance(response, dict) and response:
             raise ValueError("ticket already has a first response")
         snapshot, chosen_revision = self._knowledge_snapshot(data, article_id, revision)
         if responded_at < ticket["opened_at"]:
@@ -441,7 +447,9 @@ class SupportDesk(JsonStore):
             raise ValueError("ticket must exist and be open")
         if "opened_at" not in ticket:
             raise ValueError("ticket has no opened_at")
-        if ticket.get("first_response") is None:
+        response = ticket.get("first_response")
+        # Missing, null or an empty object means there is no first response.
+        if not isinstance(response, dict) or not response:
             raise ValueError("ticket has no first response")
         return ticket
 
@@ -502,7 +510,9 @@ class SupportDesk(JsonStore):
     def response_stats(self):
         tickets = list(self._read().get("tickets", {}).values())
         timed = [t for t in tickets if "opened_at" in t]
-        responded = [t for t in timed if t.get("first_response") is not None]
+        # Missing, null or an empty object means the ticket is still pending.
+        responded = [t for t in timed
+                     if isinstance(t.get("first_response"), dict) and t["first_response"]]
         durations = [t["first_response"]["responded_at"] - t["opened_at"] for t in responded]
         return {
             "timed": len(timed),
@@ -541,7 +551,10 @@ class SupportDesk(JsonStore):
         items = []
         untimed = 0
         for ticket in self._read().get("tickets", {}).values():
-            if ticket["status"] == "closed" or ticket.get("first_response") is not None:
+            response = ticket.get("first_response")
+            # Missing, null or an empty object means the ticket still awaits
+            # its first response and stays in the queue.
+            if ticket["status"] == "closed" or (isinstance(response, dict) and response):
                 continue
             if "opened_at" not in ticket:
                 untimed += 1
@@ -708,7 +721,8 @@ class SupportDesk(JsonStore):
             if ticket["opened_at"] > as_of:
                 raise ValueError("opened_at must not be later than as_of")
             response = ticket.get("first_response")
-            if response is not None and response["responded_at"] > as_of:
+            # Missing, null or an empty object carries no response time to check.
+            if isinstance(response, dict) and response and response["responded_at"] > as_of:
                 raise ValueError("responded_at must not be later than as_of")
         groups = []
         for priority in PRIORITIES:
@@ -722,7 +736,9 @@ class SupportDesk(JsonStore):
                     counts["untimed"] += 1
                     continue
                 response = ticket.get("first_response")
-                if response is not None:
+                # Missing, null or an empty object means there is no response:
+                # open tickets are pending, closed ones closed_without_response.
+                if isinstance(response, dict) and response:
                     counts["responded"] += 1
                     if response["responded_at"] - ticket["opened_at"] <= target:
                         counts["on_time"] += 1
