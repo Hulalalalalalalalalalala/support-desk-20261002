@@ -3837,6 +3837,231 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 2)
         self.assertIn("error", json.loads(failed.stderr))
 
+    def test_pending_queue_first_response_waits_and_strict_boundary(self):
+        self.app.open_ticket("T-9", "Alice", "A", opened_at=9)
+        self.app.open_ticket("T-10", "Bob", "B", opened_at=10)
+        queue = self.app.pending_queue(40)
+        self.assertEqual(set(queue), {"untimed", "items"})
+        rows = {i["ticket"]["ticket_id"]: i for i in queue["items"]}
+        self.assertEqual(queue["untimed"], 0)
+        self.assertEqual(set(rows["T-9"]),
+                         {"ticket", "response_wait", "customer_wait", "count", "overdue"})
+        self.assertEqual((rows["T-9"]["response_wait"], rows["T-9"]["customer_wait"],
+                          rows["T-9"]["count"], rows["T-9"]["overdue"]), (31, None, 0, True))
+        self.assertEqual((rows["T-10"]["response_wait"], rows["T-10"]["overdue"]), (30, False))
+        self.assertIsNone(rows["T-9"]["customer_wait"])
+        self.assertEqual(rows["T-9"]["ticket"], self.app.get("T-9"))
+
+    def test_pending_queue_null_and_empty_first_response_still_pending(self):
+        self._received_ticket("T-null", 0)
+        self._received_ticket("T-empty", 0)
+        data = self.app._read()
+        data["tickets"]["T-empty"]["first_response"] = {}
+        self.app._write(data)
+        rows = {i["ticket"]["ticket_id"]: i for i in self.app.pending_queue(40)["items"]}
+        self.assertEqual(rows["T-null"]["response_wait"], 40)
+        self.assertEqual(rows["T-empty"]["response_wait"], 40)
+
+    def test_pending_queue_untimed_and_responded_without_followups_excluded(self):
+        self.app.open_ticket("T-untimed", "Alice", "A")
+        self._received_ticket("T-answered", 0)
+        self.app.respond("T-answered", "r", 5)
+        self._received_ticket("T-closed", 0)
+        self.app.assign("T-closed", "Eve")
+        self.app.close("T-closed", "Done")
+        queue = self.app.pending_queue(10)
+        self.assertEqual(queue["untimed"], 1)
+        self.assertEqual(queue["items"], [])
+        # unassigned tickets still take part
+        self._received_ticket("T-open", 0)
+        self.assertIsNone(self.app.get("T-open")["assignee"])
+        self.assertEqual([i["ticket"]["ticket_id"] for i in self.app.pending_queue(10)["items"]],
+                         ["T-open"])
+
+    def test_pending_queue_customer_wait_boundary_and_count(self):
+        self._received_ticket("T", 0)
+        self.app.respond("T", "first", 10)
+        self.app.receive("T", "q-before", 5)
+        self.app.receive("T", "q-same", 10)
+        self.app.reply("T", "second", 20)
+        self.app.receive("T", "q-reply-same", 20)
+        self.app.receive("T", "q-one", 21)
+        self.app.receive("T", "q-two", 40)
+        row = next(i for i in self.app.pending_queue(50)["items"]
+                   if i["ticket"]["ticket_id"] == "T")
+        self.assertIsNone(row["response_wait"])
+        self.assertEqual((row["customer_wait"], row["count"], row["overdue"]), (29, 2, False))
+        # equality is not overdue; one more minute is
+        self.assertFalse(next(i for i in self.app.pending_queue(51)["items"]
+                              if i["ticket"]["ticket_id"] == "T")["overdue"])
+        self.assertTrue(next(i for i in self.app.pending_queue(52)["items"]
+                             if i["ticket"]["ticket_id"] == "T")["overdue"])
+
+    def test_pending_queue_without_any_answer_carries_both_waits(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "one", 5)
+        self.app.receive("T", "two", 8)
+        row = next(i for i in self.app.pending_queue(40)["items"]
+                   if i["ticket"]["ticket_id"] == "T")
+        self.assertEqual((row["response_wait"], row["customer_wait"], row["count"]), (40, 35, 2))
+        self.assertTrue(row["overdue"])
+
+    def test_pending_queue_each_ticket_appears_once_with_custom_targets(self):
+        self._received_ticket("R", 0)
+        self._received_ticket("M", 0)
+        self.app.respond("M", "r", 0)
+        self.app.receive("M", "q", 10)
+        queue = self.app.pending_queue(20, response_minutes=20, customer_minutes=10)
+        by_id = {i["ticket"]["ticket_id"]: i for i in queue["items"]}
+        self.assertEqual(set(by_id), {"R", "M"})
+        self.assertFalse(by_id["R"]["overdue"])
+        self.assertFalse(by_id["M"]["overdue"])
+        queue = self.app.pending_queue(21, response_minutes=20, customer_minutes=10)
+        by_id = {i["ticket"]["ticket_id"]: i for i in queue["items"]}
+        self.assertTrue(by_id["R"]["overdue"])
+        self.assertTrue(by_id["M"]["overdue"])
+
+    def test_pending_queue_sorting_overdue_priority_max_wait_id(self):
+        self._received_ticket("late-normal", 0)
+        self.app.set_priority("late-normal", "normal")
+        self._received_ticket("late-urgent", 0)
+        self.app.set_priority("late-urgent", "urgent")
+        self._received_ticket("ontime-high", 20)
+        self.app.set_priority("ontime-high", "high")
+        self._received_ticket("ontime-normal1", 10)
+        self._received_ticket("ontime-normal2", 15)
+        self._received_ticket("a", 10)
+        order = [i["ticket"]["ticket_id"] for i in self.app.pending_queue(40)["items"]]
+        # overdue first (urgent then normal), then high, then normal by max-wait
+        # descending (30,30 tie broken by id then 25)
+        self.assertEqual(order,
+                         ["late-urgent", "late-normal", "ontime-high", "a",
+                          "ontime-normal1", "ontime-normal2"])
+        self.assertTrue(all(i["overdue"] for i in self.app.pending_queue(40)["items"][:2]))
+        self.assertFalse(any(i["overdue"] for i in self.app.pending_queue(40)["items"][2:]))
+
+    def test_pending_queue_raises_on_future_times_without_partial_results(self):
+        # future opened_at on a pending ticket
+        self.app.open_ticket("T-future", "Alice", "A", opened_at=50)
+        self._received_ticket("T-ok", 0)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.pending_queue(40)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # future follow-up, even one covered by a later answer, is still checked
+        self.app = SupportDesk(self.root / "fresh2")
+        self._received_ticket("T", 0)
+        self.app.respond("T", "r", 5)
+        self.app.receive("T", "q", 40)
+        with self.assertRaises(ValueError):
+            self.app.pending_queue(30)
+        # future first response
+        self.app = SupportDesk(self.root / "fresh3")
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q", 5)
+        self.app.respond("T", "r", 40)
+        with self.assertRaises(ValueError):
+            self.app.pending_queue(30)
+        # future reply
+        self.app = SupportDesk(self.root / "fresh4")
+        self._received_ticket("T", 0)
+        self.app.respond("T", "r", 5)
+        self.app.receive("T", "q", 6)
+        self.app.reply("T", "rr", 45)
+        with self.assertRaises(ValueError):
+            self.app.pending_queue(30)
+
+    def test_pending_queue_closed_tickets_escape_future_check_and_queue(self):
+        self._received_ticket("T", 0)
+        self.app.respond("T", "r", 5)
+        self.app.receive("T", "q", 40)
+        self.app.assign("T", "Eve")
+        self.app.close("T", "Done")
+        self.assertEqual(self.app.pending_queue(30), {"untimed": 0, "items": []})
+        self.app.reopen_ticket("T", "back")
+        with self.assertRaises(ValueError):
+            self.app.pending_queue(30)
+
+    def test_pending_queue_bad_arguments_missing_and_unknown(self):
+        for as_of in (True, 1.5, "40", None, -1):
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.pending_queue(as_of)
+        for target in (0, -5, True, 30.0, "30", None):
+            with self.assertRaises(ValueError, msg=target):
+                self.app.pending_queue(40, target)
+            with self.assertRaises(ValueError, msg=target):
+                self.app.pending_queue(40, 30, target)
+        with self.assertRaises(TypeError):
+            self.app.pending_queue()
+        with self.assertRaises(TypeError):
+            self.app.pending_queue(40, bogus=1)
+        # validation still runs on empty data
+        self.assertEqual(self.app.pending_queue(0), {"untimed": 0, "items": []})
+        with self.assertRaises(ValueError):
+            self.app.pending_queue(-1)
+        missing = self.root / "missing"
+        self.assertEqual(SupportDesk(missing).pending_queue(0),
+                         {"untimed": 0, "items": []})
+        self.assertFalse(missing.exists())
+
+    def test_pending_queue_is_read_only(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q", 50)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.pending_queue(30)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.app.pending_queue(60)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_pending_queue_close_reopen_uses_history(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q", 5)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in self.app.pending_queue(10)["items"]],
+                         ["T"])
+        self.app.assign("T", "Eve")
+        self.app.close("T", "Done")
+        self.assertEqual(self.app.pending_queue(10)["items"], [])
+        self.app.reopen_ticket("T", "back")
+        row = self.app.pending_queue(10)["items"][0]
+        self.assertEqual(row["ticket"]["ticket_id"], "T")
+        self.assertEqual(row["count"], 1)
+        self.app.respond("T", "answer", 10)
+        self.assertEqual(self.app.pending_queue(10)["items"], [])
+
+    def test_cli_pending_queue_object_and_array(self):
+        self._received_ticket("T-1", 0)
+        self.app.respond("T-1", "answer", 10)
+        self.app.receive("T-1", "later", 30)
+        payload = self.root / "pending.json"
+        payload.write_text(json.dumps({"as_of": 61}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "pending-queue", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(set(value), {"untimed", "items"})
+        self.assertEqual([(i["ticket"]["ticket_id"], i["response_wait"], i["customer_wait"],
+                           i["count"], i["overdue"]) for i in value["items"]],
+                         [("T-1", None, 31, 1, True)])
+        # an outer array repeats the independent query
+        batch = self.root / "pending-batch.json"
+        batch.write_text(json.dumps([{"as_of": 60}, {"as_of": 61, "response_minutes": 5,
+                                                     "customer_minutes": 5}]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "pending-queue", str(batch)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = json.loads(result.stdout)
+        self.assertEqual(len(values), 2)
+        self.assertFalse(values[0]["items"][0]["overdue"])
+        self.assertTrue(values[1]["items"][0]["overdue"])
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"as_of": True}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "pending-queue", str(bad)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
     def test_customer_response_report_matches_each_follow_up_independently(self):
         self._received_ticket("T", 0)
         self.app.receive("T", "q1", 10)

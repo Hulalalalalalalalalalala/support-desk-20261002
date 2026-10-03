@@ -718,6 +718,66 @@ class SupportDesk(JsonStore):
                  "overdue": waiting > target_minutes}
                 for earliest, ticket, count, waiting in entries]
 
+    def pending_queue(self, as_of, response_minutes=30, customer_minutes=30):
+        as_of = minute(as_of, "as_of")
+        response_minutes = positive(response_minutes, "response_minutes")
+        customer_minutes = positive(customer_minutes, "customer_minutes")
+        entries = []
+        untimed = 0
+        # All future-time validation runs before the queue is built, so one
+        # invalid ticket rejects the whole query without partial results.
+        for ticket in self._read().get("tickets", {}).values():
+            if ticket["status"] != "open":
+                continue
+            response = ticket.get("first_response")
+            # Missing, null or an empty object means the ticket still awaits
+            # its first response; only a non-empty object carries answer times.
+            has_response = isinstance(response, dict) and bool(response)
+            awaits_response = not has_response
+            messages = ticket.get("customer_messages") or []
+            if awaits_response and "opened_at" in ticket:
+                if ticket["opened_at"] > as_of:
+                    raise ValueError("opened_at must not be later than as_of")
+            answer_times = ([response["responded_at"]] if has_response else [])
+            answer_times.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
+            if messages:
+                # Any follow-up history (even fully covered) and any answer
+                # time later than as_of invalidates the whole query.
+                if any(message["received_at"] > as_of for message in messages) or \
+                        any(time > as_of for time in answer_times):
+                    raise ValueError("customer message or response time must not be later than as_of")
+            response_wait = None
+            if awaits_response:
+                if "opened_at" in ticket:
+                    response_wait = as_of - ticket["opened_at"]
+                else:
+                    untimed += 1
+            boundary = max(answer_times) if answer_times else None
+            # A follow-up in the same minute as an answer is already covered;
+            # only strictly later times remain unanswered, each counted on its own.
+            unanswered = [message["received_at"] for message in messages
+                          if boundary is None or message["received_at"] > boundary]
+            if unanswered:
+                customer_wait = as_of - min(unanswered)
+            else:
+                customer_wait = None
+            if response_wait is None and customer_wait is None:
+                continue
+            overdue = (response_wait is not None and response_wait > response_minutes) or \
+                      (customer_wait is not None and customer_wait > customer_minutes)
+            waits = [wait for wait in (response_wait, customer_wait) if wait is not None]
+            entries.append({"ticket": ticket, "response_wait": response_wait,
+                            "customer_wait": customer_wait, "count": len(unanswered),
+                            "overdue": overdue,
+                            "_sort": (0 if overdue else 1,
+                                      PRIORITY_RANK[ticket.get("priority", "normal")],
+                                      -max(waits), ticket["ticket_id"])})
+        entries.sort(key=lambda item: item["_sort"])
+        items = [{"ticket": item["ticket"], "response_wait": item["response_wait"],
+                  "customer_wait": item["customer_wait"], "count": item["count"],
+                  "overdue": item["overdue"]} for item in entries]
+        return {"untimed": untimed, "items": items}
+
     def customer_response_report(self, as_of, since=0, until=None):
         # Parameters are validated even when the store holds no data.
         as_of = minute(as_of, "as_of")
