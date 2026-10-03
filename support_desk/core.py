@@ -895,6 +895,34 @@ class SupportDesk(JsonStore):
                      if ticket["ticket_id"] not in assigned_ids]
         return {"assigned": assigned, "remaining": remaining}
 
+    def conversation(self, ticket_id, offset=0, limit=20):
+        ticket_id = text(ticket_id, "ticket_id")
+        # bool is a subclass of int, so compare types explicitly; floats and strings are rejected too.
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        ticket = self._read().get("tickets", {}).get(ticket_id)
+        if ticket is None:
+            raise ValueError("unknown ticket")
+        entries = []
+        for index, message in enumerate(ticket.get("customer_messages") or []):
+            entries.append({"kind": "customer_message", "index": index,
+                            "at": message["received_at"], "record": message})
+        response = ticket.get("first_response")
+        # Missing, null or an empty object means there is no first response.
+        if isinstance(response, dict) and response:
+            entries.append({"kind": "first_response", "index": None,
+                            "at": response["responded_at"], "record": response})
+        for index, reply in enumerate(ticket.get("replies") or []):
+            entries.append({"kind": "reply", "index": index,
+                            "at": reply["replied_at"], "record": reply})
+        order = {"customer_message": 0, "first_response": 1, "reply": 2}
+        entries.sort(key=lambda entry: (entry["at"], order[entry["kind"]],
+                                        entry["index"] if entry["index"] is not None else 0))
+        return {"ticket_id": ticket_id, "total": len(entries),
+                "items": entries[offset:offset + limit]}
+
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")
