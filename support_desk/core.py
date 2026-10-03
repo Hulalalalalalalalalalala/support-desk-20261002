@@ -145,6 +145,47 @@ def _route_coverage(candidates, rule_by_category, loads, limits):
     return choices
 
 
+def _service_periods(service_periods):
+    if service_periods is None:
+        return None
+    if not isinstance(service_periods, list):
+        raise ValueError("service_periods must be an array or null")
+    intervals = []
+    for period in service_periods:
+        if not isinstance(period, list) or len(period) != 2:
+            raise ValueError("each service period must be a [start, end] pair")
+        start, end = period
+        # bool is a subclass of int, so compare types explicitly.
+        if type(start) is not int or type(end) is not int:
+            raise ValueError("service period endpoints must be nonnegative integer minutes")
+        if start < 0 or end < 0 or start >= end:
+            raise ValueError("service period endpoints must be nonnegative with start earlier than end")
+        intervals.append((start, end))
+    # Merge overlapping, repeated and touching periods: covered minutes are
+    # counted once and input order never changes the result.
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _service_minutes(periods, start, end):
+    # Half-open intervals: minutes at start count, the minute at end does not.
+    total = 0
+    for left, right in periods:
+        if right <= start:
+            continue
+        if left >= end:
+            break
+        total += min(right, end) - max(left, start)
+    return total
+
+
 class SupportDesk(JsonStore):
     def open_ticket(self, ticket_id, customer, subject, opened_at=None):
         ticket_id, customer, subject = text(ticket_id, "ticket_id"), text(customer, "customer"), text(subject, "subject")
@@ -704,7 +745,7 @@ class SupportDesk(JsonStore):
         }
         return {"as_of": as_of, "summary": summary, "items": items}
 
-    def response_target_report(self, as_of, targets=None, since=None, until=None):
+    def response_target_report(self, as_of, targets=None, since=None, until=None, service_periods=None):
         as_of = minute(as_of, "as_of")
         target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
         if targets is not None:
@@ -720,6 +761,7 @@ class SupportDesk(JsonStore):
             until = minute(until, "until")
         if since is not None and until is not None and until < since:
             raise ValueError("until must not be earlier than since")
+        periods = _service_periods(service_periods)
         tickets = list(self._read().get("tickets", {}).values())
         if since is None and until is None:
             # No window: every ticket takes part, untimed ones included.
@@ -759,7 +801,14 @@ class SupportDesk(JsonStore):
                 # open tickets are pending, closed ones closed_without_response.
                 if isinstance(response, dict) and response:
                     counts["responded"] += 1
-                    if response["responded_at"] - ticket["opened_at"] <= target:
+                    if periods is None:
+                        elapsed = response["responded_at"] - ticket["opened_at"]
+                    else:
+                        # Only minutes covered by a service period count; periods
+                        # before registration or after the response contribute nothing.
+                        elapsed = _service_minutes(periods, ticket["opened_at"],
+                                                  response["responded_at"])
+                    if elapsed <= target:
                         counts["on_time"] += 1
                     else:
                         counts["late"] += 1
@@ -767,7 +816,11 @@ class SupportDesk(JsonStore):
                     counts["closed_without_response"] += 1
                 else:
                     counts["pending"] += 1
-                    if as_of - ticket["opened_at"] > target:
+                    if periods is None:
+                        elapsed = as_of - ticket["opened_at"]
+                    else:
+                        elapsed = _service_minutes(periods, ticket["opened_at"], as_of)
+                    if elapsed > target:
                         counts["overdue"] += 1
             rate = counts["on_time"] / counts["responded"] if counts["responded"] else None
             groups.append({"priority": priority, "target_minutes": target, **counts, "on_time_rate": rate})

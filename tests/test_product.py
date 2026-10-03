@@ -793,6 +793,162 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(sum(g["responded"] + g["pending"] for g in report["groups"]), 0)
         self.assertFalse(missing.exists())
 
+    def test_response_target_report_service_periods_match_worked_example(self):
+        periods = [[10, 20], [30, 50]]
+        self.app.open_ticket("T-done", "Alice", "A", opened_at=15)
+        self.app.respond("T-done", "Seen", 40)
+        self.app.open_ticket("T-wait", "Bob", "B", opened_at=15)
+        # 15..19 contribute 5 minutes and 30..39 ten more: 15 service minutes.
+        groups = self._report_groups(self.app.response_target_report(40, {"normal": 15}, service_periods=periods))
+        normal = groups["normal"]
+        self.assertEqual((normal["responded"], normal["on_time"], normal["late"]), (1, 1, 0))
+        self.assertEqual((normal["pending"], normal["overdue"]), (1, 0))
+        # the next minute is a covered service minute, so the pending ticket turns overdue
+        groups41 = self._report_groups(self.app.response_target_report(41, {"normal": 15}, service_periods=periods))
+        self.assertEqual((groups41["normal"]["pending"], groups41["normal"]["overdue"]), (1, 1))
+        # elapsed equals the target is on time, not late
+        self.app.open_ticket("T-late", "Cara", "C", opened_at=15)
+        self.app.respond("T-late", "Seen", 41)
+        groups_late = self._report_groups(self.app.response_target_report(41, {"normal": 15}, service_periods=periods))
+        self.assertEqual((groups_late["normal"]["responded"], groups_late["normal"]["on_time"],
+                          groups_late["normal"]["late"]), (2, 1, 1))
+
+    def test_response_target_report_null_service_periods_keeps_natural_minutes(self):
+        self._response_report_scenario()
+        baseline = self.app.response_target_report(100)
+        self.assertEqual(self.app.response_target_report(100, service_periods=None), baseline)
+        # covered minutes equal the natural span, so counts coincide too
+        covering = self.app.response_target_report(100, service_periods=[[0, 100]])
+        self.assertEqual(covering, baseline)
+
+    def test_response_target_report_empty_service_periods_makes_all_met(self):
+        self._response_report_scenario()
+        report = self.app.response_target_report(100, service_periods=[])
+        normal = self._report_groups(report)["normal"]
+        self.assertEqual((normal["responded"], normal["on_time"], normal["late"]), (2, 2, 0))
+        self.assertEqual((normal["pending"], normal["overdue"]), (2, 0))
+        self.assertEqual(normal["on_time_rate"], 1.0)
+        # untouched classifications stay as they are
+        self.assertEqual((normal["untimed"], normal["closed_without_response"]), (1, 1))
+
+    def test_response_target_report_service_periods_merge_and_order_independent(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        self.app.respond("T", "Seen", 10)
+        # overlapping, repeated, touching and out-of-order periods: the covered
+        # minutes 0..9 are counted once, elapsed is 10 and meets the target.
+        variants = [
+            [[0, 6], [5, 10]],
+            [[5, 10], [0, 5]],          # touching: [0,5) + [5,10)
+            [[0, 10], [0, 6], [2, 4]],  # duplicates and containment
+            [[20, 30], [0, 10], [-0, 6]],
+        ]
+        for periods in variants:
+            groups = self._report_groups(
+                self.app.response_target_report(10, {"normal": 10}, service_periods=periods))
+            self.assertEqual((groups["normal"]["on_time"], groups["normal"]["late"]), (1, 0), periods)
+        # [0,5) and [6,10) leave minute 5 uncovered: 9 elapsed minutes miss a target of 8
+        groups = self._report_groups(
+            self.app.response_target_report(10, {"normal": 8}, service_periods=[[0, 5], [6, 10]]))
+        self.assertEqual((groups["normal"]["on_time"], groups["normal"]["late"]), (0, 1))
+
+    def test_response_target_report_service_periods_outside_span_are_ignored(self):
+        self.app.open_ticket("T-done", "Alice", "A", opened_at=50)
+        self.app.respond("T-done", "Seen", 60)
+        self.app.open_ticket("T-wait", "Bob", "B", opened_at=50)
+        periods = [[0, 40], [70, 100]]
+        groups = self._report_groups(self.app.response_target_report(65, {"normal": 1}, service_periods=periods))
+        normal = groups["normal"]
+        # no covered minute inside either span: responded is on time with 0 elapsed
+        self.assertEqual((normal["responded"], normal["on_time"], normal["late"]), (1, 1, 0))
+        # pending accumulates 0 covered minutes and is never overdue
+        self.assertEqual((normal["pending"], normal["overdue"]), (1, 0))
+
+    def test_response_target_report_service_periods_with_selection_window(self):
+        # since/until only select by opened_at and never truncate the elapsed span
+        self.app.open_ticket("T-in", "Alice", "A", opened_at=20)
+        self.app.respond("T-in", "Seen", 80)
+        self.app.open_ticket("T-out", "Bob", "B", opened_at=90)
+        self.app.respond("T-out", "Seen", 95)
+        report = self.app.response_target_report(100, {"normal": 10}, since=0, until=90,
+                                                 service_periods=[[0, 100]])
+        normal = self._report_groups(report)["normal"]
+        # T-in spans 60 covered minutes and is late; T-out is outside the window
+        self.assertEqual((normal["responded"], normal["on_time"], normal["late"]), (1, 0, 1))
+
+    def test_response_target_report_service_periods_keep_special_classifications(self):
+        self.app.open_ticket("T-untimed", "Fay", "F")
+        self.app.assign("T-untimed", "Gus")
+        self.app.close("T-untimed", "Done")
+        self.app.open_ticket("T-closed-unanswered", "Han", "G", opened_at=70)
+        self.app.assign("T-closed-unanswered", "Ivy")
+        self.app.close("T-closed-unanswered", "Closed anyway")
+        report = self.app.response_target_report(100, service_periods=[])
+        normal = self._report_groups(report)["normal"]
+        self.assertEqual((normal["untimed"], normal["closed_without_response"]), (1, 1))
+        self.assertEqual((normal["responded"], normal["pending"]), (0, 0))
+
+    def test_response_target_report_service_periods_still_checks_future_times(self):
+        self.app.open_ticket("T-future", "Alice", "A", opened_at=101)
+        self.app.open_ticket("T-answer", "Bob", "B", opened_at=90)
+        self.app.respond("T-answer", "Seen", 101)
+        before = self.app.path.read_bytes()
+        for periods in ([], [[0, 200]], None):
+            with self.assertRaises(ValueError, msg=periods):
+                self.app.response_target_report(100, service_periods=periods)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_response_target_report_rejects_bad_service_periods(self):
+        self._response_report_scenario()
+        before = self.app.path.read_bytes()
+        bad_periods = [
+            {}, "x", 5, True, False,              # non-array and non-null
+            [[0, 10], "x"],                        # element not an array
+            [[0]], [[0, 10, 20]], [[0]],           # wrong pair shape
+            [[True, 10]], [[0, False]],            # booleans rejected even though int-like
+            [[0.0, 10]], [[0, 10.0]],              # floats
+            [[None, 10]], [[0, "10"]], [[0, None]],
+            [[-1, 10]], [[0, -10]],                # negative endpoints
+            [[10, 10]], [[20, 10]],                # start not earlier than end
+        ]
+        for periods in bad_periods:
+            with self.assertRaises(ValueError, msg=periods):
+                self.app.response_target_report(100, service_periods=periods)
+        with self.assertRaises(TypeError):
+            self.app.response_target_report(100, service_periods=[], extra=1)
+        # every parameter is validated even with no data or an empty window
+        SupportDesk(self.root / "empty").response_target_report(0, service_periods=[])
+        with self.assertRaises(ValueError):
+            SupportDesk(self.root / "empty2").response_target_report(
+                0, since=10, until=10, service_periods=[[-1, 5]])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_response_target_report_service_periods_are_not_saved(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=15)
+        self.app.respond("T", "Seen", 40)
+        before = self.app.path.read_bytes()
+        self.app.response_target_report(40, service_periods=[[10, 20], [30, 50]])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertNotIn("service_periods", self.app.get("T"))
+
+    def test_cli_response_target_report_with_service_periods(self):
+        self.app.open_ticket("T-done", "Alice", "A", opened_at=15)
+        self.app.respond("T-done", "Seen", 40)
+        self.app.open_ticket("T-wait", "Bob", "B", opened_at=15)
+        payload = self.root / "report.json"
+        payload.write_text(json.dumps({"as_of": 40, "targets": {"normal": 15},
+                                       "service_periods": [[10, 20], [30, 50]]}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "response-target-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        normal = self._report_groups(json.loads(result.stdout))["normal"]
+        self.assertEqual((normal["responded"], normal["on_time"], normal["late"]), (1, 1, 0))
+        self.assertEqual((normal["pending"], normal["overdue"]), (1, 0))
+        # invalid periods fail through the same error envelope without output
+        payload.write_text(json.dumps({"as_of": 40, "service_periods": [[20, 10]]}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "response-target-report", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(failed.stdout, "")
+
     def test_set_knowledge_enabled_persists_and_repeat_is_quiet(self):
         self._closed_ticket()
         entry = self.app.publish_knowledge("KB-1", "T")
