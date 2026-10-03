@@ -704,8 +704,15 @@ class SupportDesk(JsonStore):
         }
         return {"as_of": as_of, "summary": summary, "items": items}
 
-    def response_target_report(self, as_of, targets=None):
+    def response_target_report(self, as_of, targets=None, since=None, until=None):
+        # Parameters are validated even when the store holds no data.
         as_of = minute(as_of, "as_of")
+        if since is not None:
+            since = minute(since, "since")
+        if until is not None:
+            until = minute(until, "until")
+        if since is not None and until is not None and until < since:
+            raise ValueError("until must not be earlier than since")
         target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
         if targets is not None:
             if not isinstance(targets, dict):
@@ -715,7 +722,24 @@ class SupportDesk(JsonStore):
                     raise ValueError("targets has an unknown priority: " + str(priority))
                 target_minutes[priority] = positive(value, "targets." + priority)
         tickets = list(self._read().get("tickets", {}).values())
-        for ticket in tickets:
+        windowed = since is not None or until is not None
+        if windowed:
+            # The window selects tickets by registration time only: since is
+            # inclusive, until exclusive and a null side means no bound there;
+            # equal bounds make the interval empty. Bounds may lie later than
+            # as_of. Old tickets without opened_at never match a window query;
+            # replies, closures and reopen times are not looked at.
+            selected = [ticket for ticket in tickets
+                        if "opened_at" in ticket
+                        and (since is None or ticket["opened_at"] >= since)
+                        and (until is None or ticket["opened_at"] < until)]
+        else:
+            # With neither bound given the report keeps its original scope,
+            # including tickets that have no opened_at.
+            selected = tickets
+        for ticket in selected:
+            # Only a selected ticket's future times invalidate the query;
+            # tickets outside the window are never checked.
             if "opened_at" not in ticket:
                 continue
             if ticket["opened_at"] > as_of:
@@ -729,15 +753,17 @@ class SupportDesk(JsonStore):
             target = target_minutes[priority]
             counts = {"responded": 0, "on_time": 0, "late": 0, "pending": 0,
                       "overdue": 0, "untimed": 0, "closed_without_response": 0}
-            for ticket in tickets:
+            for ticket in selected:
                 if ticket.get("priority", "normal") != priority:
                     continue
                 if "opened_at" not in ticket:
                     counts["untimed"] += 1
                     continue
                 response = ticket.get("first_response")
-                # Missing, null or an empty object means there is no response:
-                # open tickets are pending, closed ones closed_without_response.
+                # A first response outside the window still counts: its elapsed
+                # time starts at the original opened_at, and later replies never
+                # replace it. Missing, null or an empty object means there is no
+                # response: open tickets are pending, closed ones closed_without_response.
                 if isinstance(response, dict) and response:
                     counts["responded"] += 1
                     if response["responded_at"] - ticket["opened_at"] <= target:
