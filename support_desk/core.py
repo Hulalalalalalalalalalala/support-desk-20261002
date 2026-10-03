@@ -13,11 +13,12 @@ class _Edge:
         self.to, self.rev, self.cap = to, rev, cap
 
 
-def _route_coverage(candidates, rule_by_category, loads, max_open):
+def _route_coverage(candidates, rule_by_category, loads, limits):
     # Choose a globally feasible plan maximizing the number of assigned tickets.
     # Residual flow decides feasibility of each tentative decision; rerouting
     # through reverse edges lets an earlier ticket keep an undecided recipient.
-    capacities = {name: max_open - load for name, load in loads.items() if load < max_open}
+    capacities = {name: limits[name] - load for name, load in loads.items()
+                  if load < limits[name]}
     options = []
     for ticket in candidates:
         names = rule_by_category.get(ticket.get("category"))
@@ -1089,13 +1090,14 @@ class SupportDesk(JsonStore):
                      if ticket["ticket_id"] not in assigned_ids]
         return {"assigned": assigned, "remaining": remaining}
 
-    def route_assign(self, rules, max_open=5, strategy="greedy"):
+    def route_assign(self, rules, max_open=5, strategy="greedy", assignee_limits=None):
         if strategy not in ("greedy", "coverage"):
             raise ValueError("strategy must be greedy or coverage")
         if not isinstance(rules, list) or not rules:
             raise ValueError("rules must be a nonempty array")
         normalized = []
         categories = set()
+        rule_names = set()
         for rule in rules:
             if not isinstance(rule, dict) or set(rule) != {"category", "assignees"}:
                 raise ValueError("each rule must be an object with only category and assignees")
@@ -1118,7 +1120,28 @@ class SupportDesk(JsonStore):
             if len(set(names)) != len(names):
                 raise ValueError("assignees must not contain duplicate names")
             normalized.append((category, names))
+            rule_names.update(names)
         max_open = positive(max_open, "max_open")
+        # Omitted or null means everyone shares max_open; names are trimmed the
+        # same way rule assignees are and must name one of them. Limits are
+        # validated before any data is read, so a bad object rejects the call
+        # even with no candidates.
+        custom_limits = {}
+        if assignee_limits is not None:
+            if not isinstance(assignee_limits, dict):
+                raise ValueError("assignee_limits must be an object or null")
+            for raw_name, limit in assignee_limits.items():
+                if not isinstance(raw_name, str) or not raw_name.strip():
+                    raise ValueError("assignee_limits names must be nonblank strings")
+                name = raw_name.strip()
+                if name not in rule_names:
+                    raise ValueError("assignee_limits has an unknown assignee: " + name)
+                if name in custom_limits:
+                    raise ValueError("assignee_limits must not contain duplicate names")
+                # bool is a subclass of int, so compare types explicitly.
+                if type(limit) is not int or limit < 0:
+                    raise ValueError("assignee_limits values must be nonnegative integers")
+                custom_limits[name] = limit
         data = self._read()
         tickets = data.get("tickets", {})
         rule_by_category = {category: names for category, names in normalized}
@@ -1126,6 +1149,9 @@ class SupportDesk(JsonStore):
         for _, names in normalized:
             for name in names:
                 loads.setdefault(name, 0)
+        # Names without a personal limit share max_open; a limit of zero, or a
+        # current load already at or over it, simply keeps the person idle.
+        limits = {name: custom_limits.get(name, max_open) for name in loads}
         # Load is the current count of open tickets across every category; a name
         # shared by several rules carries one shared load.
         for ticket in tickets.values():
@@ -1148,7 +1174,7 @@ class SupportDesk(JsonStore):
                 names = rule_by_category.get(ticket.get("category"))
                 if names is None:
                     continue
-                available = [name for name in names if loads[name] < max_open]
+                available = [name for name in names if loads[name] < limits[name]]
                 if not available:
                     continue
                 chosen = min(available, key=lambda name: (loads[name], name))
@@ -1160,7 +1186,7 @@ class SupportDesk(JsonStore):
             # Pick the global plan with the most assignments; ties prefer
             # assigning the earlier candidate, then the lexicographically
             # smallest recipient sequence in candidate order.
-            choices = _route_coverage(candidates, rule_by_category, loads, max_open)
+            choices = _route_coverage(candidates, rule_by_category, loads, limits)
             for ticket, chosen in zip(candidates, choices):
                 if chosen is None:
                     continue

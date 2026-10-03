@@ -3072,6 +3072,214 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.stdout, "")
         self.assertIn("error", json.loads(failed.stderr))
 
+    def test_route_assign_assignee_limits_spec_example(self):
+        # Both eligible for the first ticket, only 甲 for the next two; with
+        # limits 甲=2, 乙=1 coverage must hand the first ticket to 乙 so all
+        # three are assigned. 乙 sorts before 甲 case-sensitively, so greedy
+        # reaches the same plan.
+        rules = [{"category": "both", "assignees": ["甲", "乙"]},
+                 {"category": "jia", "assignees": ["甲"]}]
+        limits = {"甲": 2, "乙": 1}
+        for strategy in ("greedy", "coverage"):
+            root = self.root / strategy
+            app = SupportDesk(root)
+            app.open_ticket("J", "c", "j", opened_at=1)
+            app.set_category("J", "both")
+            app.open_ticket("Y1", "c", "y1", opened_at=2)
+            app.set_category("Y1", "jia")
+            app.open_ticket("Y2", "c", "y2", opened_at=3)
+            app.set_category("Y2", "jia")
+            result = app.route_assign(rules, strategy=strategy, assignee_limits=limits)
+            self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result["assigned"]],
+                             [("J", "乙"), ("Y1", "甲"), ("Y2", "甲")], strategy)
+            self.assertEqual(result["remaining"], [])
+            again = SupportDesk(root).route_assign(rules, strategy=strategy,
+                                                   assignee_limits=limits)
+            self.assertEqual(again, {"assigned": [], "remaining": []})
+
+    def test_route_assign_assignee_limits_zero_and_existing_load(self):
+        self.app.open_ticket("T-held", "A", "h")
+        self.app.assign("T-held", "B")
+        self.app.open_ticket("T-1", "c", "a", opened_at=1)
+        self.app.set_category("T-1", "c")
+        self.app.open_ticket("T-2", "c", "b", opened_at=2)
+        self.app.set_category("T-2", "c")
+        rules = [{"category": "c", "assignees": ["A", "B"]}]
+        # A's personal limit is zero; B already carries one open ticket and its
+        # personal limit is one, so neither can take a new ticket.
+        result = self.app.route_assign(rules, max_open=5,
+                                       assignee_limits={"A": 0, "B": 1})
+        self.assertEqual(result["assigned"], [])
+        self.assertEqual(result["remaining"], ["T-1", "T-2"])
+        # Raising B's limit lets both tickets go to B; unlisted names would use
+        # max_open, but A stays at the personal zero.
+        result = self.app.route_assign(rules, max_open=5,
+                                       assignee_limits={"A": 0, "B": 3})
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result["assigned"]],
+                         [("T-1", "B"), ("T-2", "B")])
+        self.assertEqual(result["remaining"], [])
+        # existing ownership is never adjusted
+        self.assertEqual(self.app.get("T-held")["assignee"], "B")
+
+    def test_route_assign_assignee_limits_greedy_prefers_least_loaded(self):
+        for ticket_id in ("T-1", "T-2", "T-3"):
+            self.app.open_ticket(ticket_id, "c", "x")
+            self.app.set_category(ticket_id, "c")
+        # P has room for two, Q for one; the least-loaded eligible name wins
+        # each ticket with case-sensitive name tie-breaking.
+        result = self.app.route_assign(
+            [{"category": "c", "assignees": ["P", "Q"]}],
+            strategy="greedy", assignee_limits={" P ": 2, "Q": 1})
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result["assigned"]],
+                         [("T-1", "P"), ("T-2", "Q"), ("T-3", "P")])
+
+    def test_route_assign_assignee_limits_coverage_le_sequence(self):
+        for ticket_id in ("T-1", "T-2", "T-3", "T-4"):
+            self.app.open_ticket(ticket_id, "c", "x")
+            self.app.set_category(ticket_id, "c")
+        rules = [{"category": "c", "assignees": ["Z", "a", "B"]}]
+        # One slot for Z, one for B, two for a: four assignments total, and the
+        # recipient sequence must be the case-sensitive lexicographic minimum.
+        result = self.app.route_assign(rules, strategy="coverage",
+                                       assignee_limits={"Z": 1, "a": 2, "B": 1})
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result["assigned"]],
+                         [("T-1", "B"), ("T-2", "Z"), ("T-3", "a"), ("T-4", "a")])
+        self.assertEqual(result["remaining"], [])
+
+    def test_route_assign_assignee_limits_coverage_capacity_shortfall(self):
+        for ticket_id in ("T-1", "T-2", "T-3"):
+            self.app.open_ticket(ticket_id, "c", "x")
+            self.app.set_category(ticket_id, "c")
+        before = self.app.path.read_bytes()
+        # Only one personal slot exists for three tickets: the earliest goes.
+        result = self.app.route_assign(
+            [{"category": "c", "assignees": ["A", "B"]}],
+            strategy="coverage", assignee_limits={"A": 1, "B": 0})
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result["assigned"]],
+                         [("T-1", "A")])
+        self.assertEqual(result["remaining"], ["T-2", "T-3"])
+        self.assertIsNone(self.app.get("T-2")["assignee"])
+
+    def test_route_assign_assignee_limits_normalizes_names(self):
+        self.app.open_ticket("T1", "c", "x")
+        self.app.set_category("T1", "c1")
+        self.app.open_ticket("T2", "c", "x")
+        self.app.set_category("T2", "c2")
+        # Keys are trimmed like rule assignees; internal whitespace is kept and
+        # the comparison is case-sensitive.
+        result = self.app.route_assign(
+            [{"category": "c1", "assignees": ["Ann  Lee"]},
+             {"category": "c2", "assignees": ["ann lee"]}],
+            assignee_limits={" Ann  Lee ": 0, "ann lee": 1})
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result["assigned"]],
+                         [("T2", "ann lee")])
+        self.assertEqual(result["remaining"], ["T1"])
+        self.assertEqual(self.app.get("T2")["assignee"], "ann lee")
+
+    def test_route_assign_assignee_limits_rejects_bad_values_without_writing(self):
+        self.app.open_ticket("T", "c", "a")
+        self.app.set_category("T", "x")
+        before = self.app.path.read_bytes()
+        rules = [{"category": "x", "assignees": ["A", "Ann  Lee"]}]
+        bad_limits = [
+            [], "x", 1, 1.5, True, False,
+            {"A": -1}, {"A": True}, {"A": False}, {"A": 1.5},
+            {"A": "5"}, {"A": None}, {"A": 5.0},
+            {"X": 1}, {"": 1}, {"   ": 1}, {1: 1}, {None: 1},
+            {" A ": 1, "A": 2}, {" Ann  Lee ": 0, "Ann  Lee": 1},
+        ]
+        for bad in bad_limits:
+            with self.assertRaises(ValueError, msg=bad):
+                self.app.route_assign(rules, assignee_limits=bad)
+        with self.assertRaises(TypeError):
+            self.app.route_assign(rules, assignee_limits={"A": 1}, unknown=1)
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertIsNone(self.app.get("T")["assignee"])
+        # Validation also runs against an empty store with no candidates.
+        missing = self.root / "missing"
+        for bad in ({"A": -1}, {"X": 1}, [], {" A ": 0, "A": 1}):
+            with self.assertRaises(ValueError, msg=bad):
+                SupportDesk(missing).route_assign(rules, assignee_limits=bad)
+        self.assertFalse(missing.exists())
+
+    def test_route_assign_assignee_limits_empty_null_and_omitted_match_old_behavior(self):
+        rules = [{"category": "c", "assignees": ["A", "B"]}]
+        for index, value in enumerate((None, {})):
+            root = self.root / ("default" + str(index))
+            app = SupportDesk(root)
+            app.open_ticket("T", "c", "a")
+            app.set_category("T", "c")
+            result = app.route_assign(rules, assignee_limits=value)
+            self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result["assigned"]],
+                             [("T", "A")])
+        # A name absent from the object simply inherits max_open; a listed zero
+        # still blocks that person.
+        capped = SupportDesk(self.root / "capped")
+        capped.open_ticket("T-1", "c", "a")
+        capped.set_category("T-1", "c")
+        capped.open_ticket("T-2", "c", "b")
+        capped.set_category("T-2", "c")
+        result = capped.route_assign(rules, max_open=1, assignee_limits={"B": 0})
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result["assigned"]],
+                         [("T-1", "A")])
+        self.assertEqual(result["remaining"], ["T-2"])
+
+    def test_route_assign_assignee_limits_input_order_independent(self):
+        rules = [{"category": "c", "assignees": ["P", "Q"]}]
+        plans = []
+        for index, limits in enumerate(({"P": 1, "Q": 3}, {"Q": 3, "P": 1})):
+            root = self.root / ("order" + str(index))
+            app = SupportDesk(root)
+            for ticket_id in ("T-1", "T-2", "T-3", "T-4"):
+                app.open_ticket(ticket_id, "c", "x")
+                app.set_category(ticket_id, "c")
+            result = app.route_assign(rules, strategy="coverage", assignee_limits=limits)
+            plans.append([(t["ticket_id"], t["assignee"]) for t in result["assigned"]])
+        self.assertEqual(plans[0], plans[1])
+
+    def test_route_assign_assignee_limits_not_persisted(self):
+        rules = [{"category": "c", "assignees": ["A"]}]
+        self.app.open_ticket("T", "c", "a")
+        self.app.set_category("T", "c")
+        result = self.app.route_assign(rules, assignee_limits={"A": 1})
+        self.assertEqual(result["assigned"][0]["assignee"], "A")
+        stored = json.loads(self.app.path.read_text(encoding="utf-8"))
+        self.assertNotIn("assignee_limits", stored)
+        # The next call without limits uses the default max_open again, even
+        # though the earlier call gave A a personal limit of one.
+        self.app.open_ticket("T-2", "c", "b")
+        self.app.set_category("T-2", "c")
+        again = SupportDesk(self.root).route_assign(rules)
+        self.assertEqual([t["ticket_id"] for t in again["assigned"]], ["T-2"])
+
+    def test_cli_route_assign_assignee_limits(self):
+        self.app.open_ticket("T-1", "A", "a", opened_at=1)
+        self.app.set_category("T-1", "both")
+        self.app.open_ticket("T-2", "B", "b", opened_at=2)
+        self.app.set_category("T-2", "only-jia")
+        payload = self.root / "input.json"
+        payload.write_text(json.dumps({
+            "rules": [{"category": "both", "assignees": ["甲", "乙"]},
+                      {"category": "only-jia", "assignees": ["甲"]}],
+            "strategy": "coverage",
+            "assignee_limits": {"甲": 2, "乙": 1}}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "route-assign", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in value["assigned"]],
+                         [("T-1", "乙"), ("T-2", "甲")])
+        payload.write_text(json.dumps({
+            "rules": [{"category": "c", "assignees": ["A"]}],
+            "assignee_limits": {"A": -1}}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "route-assign", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
     def test_handover_distributes_by_load_and_persists(self):
         self.app.open_ticket("T-old", "Alice", "A", opened_at=1)
         self.app.assign("T-old", "A")
