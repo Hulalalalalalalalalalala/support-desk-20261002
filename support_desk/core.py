@@ -614,31 +614,56 @@ class SupportDesk(JsonStore):
                  "overdue": waiting > target_minutes}
                 for earliest, ticket, count, waiting in entries]
 
-    def customer_response_report(self, as_of):
+    def customer_response_report(self, as_of, since=0, until=None):
+        # Parameters are validated even when the store holds no data.
         as_of = minute(as_of, "as_of")
+        since = minute(since, "since")
+        if until is not None:
+            until = minute(until, "until")
+            if until < since:
+                raise ValueError("until must not be earlier than since")
         tickets = list(self._read().get("tickets", {}).values())
-        # Only tickets with a follow-up history participate; open and closed tickets alike.
+        # Only tickets with a follow-up history can contribute; open and closed tickets alike.
         participants = [ticket for ticket in tickets if ticket.get("customer_messages")]
         answers = {}
+        windowed = {}
         for ticket in participants:
+            # The window selects follow-ups by received time only: since is
+            # inclusive, until exclusive and omitted/null means no upper bound;
+            # equal bounds make the interval empty.
+            pairs = [(index, message) for index, message in enumerate(ticket["customer_messages"])
+                     if message["received_at"] >= since
+                     and (until is None or message["received_at"] < until)]
+            # A ticket without a selected follow-up takes no part in the query.
+            if not pairs:
+                continue
             response = ticket.get("first_response")
             # Missing, null or an empty object means there is no first response;
-            # handwritten and knowledge answers are collected the same way.
+            # handwritten and knowledge answers are collected the same way. The
+            # answer set ignores the window: an answer outside it may still cover
+            # a selected follow-up.
             times = [response["responded_at"]] if isinstance(response, dict) and response else []
             times.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
-            # Any follow-up or answer later than as_of invalidates the whole query.
-            if any(message["received_at"] > as_of for message in ticket["customer_messages"]) or \
+            # A selected follow-up, or any answer of the same ticket, later than
+            # as_of invalidates the whole query; follow-ups outside the window
+            # and tickets without a selected follow-up are never checked.
+            if any(message["received_at"] > as_of for _, message in pairs) or \
                     any(time > as_of for time in times):
                 raise ValueError("customer message or response time must not be later than as_of")
             answers[ticket["ticket_id"]] = times
+            windowed[ticket["ticket_id"]] = pairs
         items = []
         for ticket in participants:
             ticket_id = ticket["ticket_id"]
-            for index, message in enumerate(ticket["customer_messages"]):
+            pairs = windowed.get(ticket_id)
+            if not pairs:
+                continue
+            for index, message in pairs:
                 received_at = message["received_at"]
                 # Matching looks at time only: the earliest answer not earlier than
-                # the follow-up covers it, regardless of call order; the same answer
-                # may cover several follow-ups and equal times take zero minutes.
+                # the follow-up covers it, regardless of call order or window bounds;
+                # the same answer may cover several follow-ups and equal times take
+                # zero minutes.
                 candidates = [time for time in answers[ticket_id] if time >= received_at]
                 if candidates:
                     answered_at = min(candidates)

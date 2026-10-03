@@ -3671,6 +3671,146 @@ class ProductTests(unittest.TestCase):
             self.app.customer_response_report(2)
         self.assertEqual(before, self.app.path.read_bytes())
 
+    def test_customer_response_report_window_is_half_open_on_received_time(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q10", 10)
+        self.app.receive("T", "q15", 15)
+        self.app.receive("T", "q20", 20)
+        # the answer at 25 sits outside the window but still covers the follow-ups at 10 and 15
+        self.app.respond("T", "late answer", 25)
+        report = self.app.customer_response_report(30, since=10, until=20)
+        self.assertEqual(report["as_of"], 30)
+        self.assertEqual([(i["index"], i["received_at"], i["answered_at"],
+                           i["response_minutes"], i["outcome"]) for i in report["items"]],
+                         [(0, 10, 25, 15, "answered"), (1, 15, 25, 10, "answered")])
+        self.assertEqual(report["summary"],
+                         {"total": 2, "answered": 2, "pending": 0,
+                          "closed_without_answer": 0, "average_minutes": 12.5,
+                          "max_minutes": 15})
+
+    def test_customer_response_report_window_includes_since_without_upper_bound(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q5", 5)
+        self.app.receive("T", "q10", 10)
+        self.app.respond("T", "r", 12)
+        report = self.app.customer_response_report(20, since=10)
+        self.assertEqual([(i["index"], i["received_at"]) for i in report["items"]], [(1, 10)])
+        # explicit null until means the same as omitting it
+        self.assertEqual(self.app.customer_response_report(20, since=10, until=None), report)
+
+    def test_customer_response_report_equal_bounds_are_empty(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q10", 10)
+        self.app.respond("T", "r", 10)
+        empty = {"as_of": 10,
+                 "summary": {"total": 0, "answered": 0, "pending": 0,
+                             "closed_without_answer": 0, "average_minutes": None,
+                             "max_minutes": None},
+                 "items": []}
+        self.assertEqual(self.app.customer_response_report(10, since=10, until=10), empty)
+
+    def test_customer_response_report_window_keeps_indices_sorting_and_outcomes(self):
+        self._received_ticket("T-open", 0)
+        self.app.receive("T-open", "q5", 5)
+        self.app.receive("T-open", "q10", 10)  # still pending at as_of 20
+        self._received_ticket("T-closed", 0)
+        self.app.receive("T-closed", "q5", 5)
+        self.app.receive("T-closed", "q15", 15)
+        self.app.assign("T-closed", "Eve")
+        self.app.close("T-closed", "Done")
+        report = self.app.customer_response_report(20, since=10, until=20)
+        self.assertEqual([(i["ticket_id"], i["index"], i["received_at"], i["outcome"])
+                          for i in report["items"]],
+                         [("T-open", 1, 10, "pending"),
+                          ("T-closed", 1, 15, "closed_without_answer")])
+        self.assertEqual(report["summary"],
+                         {"total": 2, "answered": 0, "pending": 1,
+                          "closed_without_answer": 1, "average_minutes": None,
+                          "max_minutes": None})
+
+    def test_customer_response_report_window_answer_may_lie_before_since(self):
+        self._received_ticket("T", 0)
+        self.app.respond("T", "r", 8)
+        self.app.receive("T", "q5", 5)
+        self.app.receive("T", "q10", 10)  # no later answer: stays pending
+        report = self.app.customer_response_report(20, since=10, until=20)
+        self.assertEqual([(i["index"], i["answered_at"], i["outcome"])
+                          for i in report["items"]], [(1, None, "pending")])
+
+    def test_customer_response_report_window_bounds_may_be_later_than_as_of(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q5", 5)
+        self.app.respond("T", "r", 6)
+        report = self.app.customer_response_report(10, since=0, until=100)
+        self.assertEqual([(i["index"], i["response_minutes"]) for i in report["items"]],
+                         [(0, 1)])
+
+    def test_customer_response_report_window_future_answer_checked_only_with_selection(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q", 5)
+        self.app.respond("T", "r", 40)  # answer lies outside the window and beyond as_of
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.customer_response_report(30, since=0, until=20)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # once no follow-up is selected, the ticket opts out and its future
+        # answer is no longer checked
+        self.assertEqual(self.app.customer_response_report(30, since=10, until=20)["items"],
+                         [])
+
+    def test_customer_response_report_window_unselected_future_follow_up_skipped(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q-early", 5)
+        self.app.receive("T", "q-late", 40)  # beyond as_of but outside the window
+        report = self.app.customer_response_report(30, since=0, until=20)
+        self.assertEqual([(i["index"], i["received_at"], i["outcome"])
+                          for i in report["items"]], [(0, 5, "pending")])
+
+    def test_customer_response_report_window_validates_arguments_even_when_empty(self):
+        for bad in (True, False, 1.5, "10", -1):
+            with self.assertRaises(ValueError, msg=("since", bad)):
+                self.app.customer_response_report(10, since=bad)
+            with self.assertRaises(ValueError, msg=("until", bad)):
+                self.app.customer_response_report(10, until=bad)
+        with self.assertRaises(ValueError):
+            self.app.customer_response_report(10, since=20, until=10)
+        for bad_as_of in (True, False, 1.5, "40", None, -1):
+            with self.assertRaises(ValueError, msg=bad_as_of):
+                self.app.customer_response_report(bad_as_of, since=0, until=10)
+        with self.assertRaises(TypeError):
+            self.app.customer_response_report(10, bogus=1)
+        # validation runs against an empty store and a missing directory too
+        with self.assertRaises(ValueError):
+            self.app.customer_response_report(10, since=2.0)
+        missing = self.root / "missing"
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).customer_response_report(10, until=-1)
+        self.assertFalse(missing.exists())
+
+    def test_cli_customer_response_report_window(self):
+        self._received_ticket("T-1", 0)
+        self.app.receive("T-1", "q1", 10)
+        self.app.receive("T-1", "q2", 20)
+        self.app.respond("T-1", "answer", 25)
+        query = self.root / "report.json"
+        query.write_text(json.dumps({"as_of": 30, "since": 10, "until": 20}),
+                         encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "customer-response-report", str(query)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([(i["index"], i["received_at"], i["answered_at"], i["response_minutes"])
+                          for i in value["items"]], [(0, 10, 25, 15)])
+        self.assertEqual(value["summary"]["total"], 1)
+        bad = self.root / "bad-window.json"
+        bad.write_text(json.dumps({"as_of": 30, "since": 20, "until": 10}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "customer-response-report", str(bad)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("error", json.loads(failed.stderr))
+
     def test_cli_customer_response_report(self):
         self._received_ticket("T-1", 0)
         self.app.receive("T-1", "q", 10)
