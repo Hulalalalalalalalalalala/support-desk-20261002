@@ -825,6 +825,70 @@ class SupportDesk(JsonStore):
                      if ticket["ticket_id"] not in assigned_ids]
         return {"assigned": assigned, "remaining": remaining}
 
+    def route_assign(self, rules, max_open=5):
+        if not isinstance(rules, list) or not rules:
+            raise ValueError("rules must be a nonempty array")
+        parsed = []
+        categories = set()
+        names = []
+        for rule in rules:
+            if not isinstance(rule, dict) or set(rule) != {"category", "assignees"}:
+                raise ValueError("each rule must be an object with exactly category and assignees")
+            category = rule["category"]
+            if category is not None:
+                category = text(category, "category")
+            if category in categories:
+                raise ValueError("rules must not contain duplicate categories")
+            categories.add(category)
+            assignees = rule["assignees"]
+            if not isinstance(assignees, list) or not assignees:
+                raise ValueError("assignees must be a nonempty array")
+            rule_names = []
+            for element in assignees:
+                if not isinstance(element, str) or not element.strip():
+                    raise ValueError("assignees elements must be nonblank strings")
+                rule_names.append(element.strip())
+            if len(set(rule_names)) != len(rule_names):
+                raise ValueError("assignees must not contain duplicate names")
+            parsed.append((category, rule_names))
+            names.extend(rule_names)
+        max_open = positive(max_open, "max_open")
+        data = self._read()
+        tickets = data.get("tickets", {})
+        # Loads are shared across rules: one person's open tickets count against every rule.
+        loads = {name: 0 for name in names}
+        for ticket in tickets.values():
+            if ticket["status"] == "open" and ticket.get("assignee") in loads:
+                loads[ticket["assignee"]] += 1
+        def candidate_key(ticket):
+            opened_at = ticket.get("opened_at")
+            return (PRIORITY_RANK[ticket.get("priority", "normal")],
+                    opened_at is None, opened_at if opened_at is not None else 0,
+                    ticket["ticket_id"])
+        candidates = sorted((ticket for ticket in tickets.values()
+                             if ticket["status"] == "open" and ticket.get("assignee") is None),
+                            key=candidate_key)
+        routes = dict(parsed)
+        assigned = []
+        assigned_ids = set()
+        for ticket in candidates:
+            rule_names = routes.get(ticket.get("category"))
+            if rule_names is None:
+                continue
+            available = [name for name in rule_names if loads[name] < max_open]
+            if not available:
+                continue
+            chosen = min(available, key=lambda name: (loads[name], name))
+            ticket["assignee"] = chosen
+            loads[chosen] += 1
+            assigned.append(ticket)
+            assigned_ids.add(ticket["ticket_id"])
+        if assigned:
+            self._write(data)
+        remaining = [ticket["ticket_id"] for ticket in candidates
+                     if ticket["ticket_id"] not in assigned_ids]
+        return {"assigned": assigned, "remaining": remaining}
+
     def list_tickets(self, status=None):
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")
