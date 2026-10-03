@@ -1397,6 +1397,85 @@ class SupportDesk(JsonStore):
                      if ticket["ticket_id"] not in assigned_ids]
         return {"assigned": assigned, "remaining": remaining}
 
+    def route_handover(self, source_assignee, rules, reason, transferred_at, max_open=5):
+        source_assignee = text(source_assignee, "source_assignee")
+        reason = text(reason, "reason")
+        if not isinstance(rules, list) or not rules:
+            raise ValueError("rules must be a nonempty array")
+        normalized = []
+        categories = set()
+        for rule in rules:
+            if not isinstance(rule, dict) or set(rule) != {"category", "assignees"}:
+                raise ValueError("each rule must be an object with only category and assignees")
+            category = rule["category"]
+            if category is not None:
+                if not isinstance(category, str) or not category.strip():
+                    raise ValueError("rule category must be null or a nonblank string")
+                category = category.strip()
+            if category in categories:
+                raise ValueError("rules must not contain duplicate categories")
+            categories.add(category)
+            raw_assignees = rule["assignees"]
+            if not isinstance(raw_assignees, list) or not raw_assignees:
+                raise ValueError("assignees must be a nonempty array")
+            names = []
+            for element in raw_assignees:
+                if not isinstance(element, str) or not element.strip():
+                    raise ValueError("assignees elements must be nonblank strings")
+                names.append(element.strip())
+            if len(set(names)) != len(names):
+                raise ValueError("assignees must not contain duplicate names")
+            if source_assignee in names:
+                raise ValueError("assignees must not contain the source assignee")
+            normalized.append((category, names))
+        transferred_at = minute(transferred_at, "transferred_at")
+        max_open = positive(max_open, "max_open")
+        data = self._read()
+        tickets = data.get("tickets", {})
+        def candidate_key(ticket):
+            opened_at = ticket.get("opened_at")
+            return (PRIORITY_RANK[ticket.get("priority", "normal")],
+                    opened_at is None, opened_at if opened_at is not None else 0,
+                    ticket["ticket_id"])
+        selected = sorted((ticket for ticket in tickets.values()
+                           if ticket["status"] == "open" and ticket.get("assignee") == source_assignee),
+                          key=candidate_key)
+        if not selected:
+            return []
+        rule_by_category = {category: names for category, names in normalized}
+        loads = {}
+        for _, names in normalized:
+            for name in names:
+                loads.setdefault(name, 0)
+        # Load is the current count of open tickets across every category; a name
+        # shared by several rules carries one shared load and one shared capacity.
+        for ticket in tickets.values():
+            if ticket["status"] == "open" and ticket.get("assignee") in loads:
+                loads[ticket["assignee"]] += 1
+        ceilings = {name: max_open for name in loads}
+        # Every selected ticket must be placed by its own category's rule (the
+        # uncategorized rule never backstops a categorized ticket); among complete
+        # plans the lexicographically smallest recipient sequence in candidate
+        # order wins, so rule and name input order cannot change the result.
+        choices = _route_coverage(selected, rule_by_category, loads, ceilings)
+        if any(chosen is None for chosen in choices):
+            raise ValueError("rules do not cover all selected tickets within capacity")
+        for ticket in selected:
+            if "opened_at" in ticket and transferred_at < ticket["opened_at"]:
+                raise ValueError("transferred_at must not be earlier than opened_at")
+            history = ticket.get("transfer_history")
+            if history and transferred_at < history[-1]["transferred_at"]:
+                raise ValueError("transferred_at must not be earlier than the last transfer")
+        handed_over = []
+        for ticket, chosen in zip(selected, choices):
+            ticket.setdefault("transfer_history", []).append(
+                {"from_assignee": ticket["assignee"], "to_assignee": chosen,
+                 "reason": reason, "transferred_at": transferred_at})
+            ticket["assignee"] = chosen
+            handed_over.append(ticket)
+        self._write(data)
+        return handed_over
+
     def auto_categorize(self, rules):
         if not isinstance(rules, list) or not rules:
             raise ValueError("rules must be a nonempty array")

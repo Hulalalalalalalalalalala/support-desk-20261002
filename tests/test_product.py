@@ -3594,6 +3594,261 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(SupportDesk(self.root).get("T-1")["assignee"], "R")
         self.assertEqual(SupportDesk(self.root).get("T-2")["assignee"], "X")
 
+    def test_route_handover_routes_by_category_and_persists(self):
+        self.app.open_ticket("T-old", "Alice", "A", opened_at=1)
+        self.app.set_category("T-old", "billing")
+        self.app.assign("T-old", "X")
+        self.app.open_ticket("T-1", "Bob", "B", opened_at=2)
+        self.app.set_category("T-1", "billing")
+        self.app.assign("T-1", "S")
+        self.app.open_ticket("T-2", "Cara", "C", opened_at=3)
+        self.app.set_category("T-2", "network")
+        self.app.assign("T-2", "S")
+        self.app.open_ticket("T-closed", "Dan", "D")
+        self.app.set_category("T-closed", "billing")
+        self.app.assign("T-closed", "S")
+        self.app.close("T-closed", "Done")
+        rules = [{"category": " billing ", "assignees": [" X ", "Y"]},
+                 {"category": "network", "assignees": ["Y"]}]
+        result = self.app.route_handover(" S ", rules, " 轮 岗 ", 10, max_open=3)
+        self.assertEqual([t["ticket_id"] for t in result], ["T-1", "T-2"])
+        # [X, Y] is the lexicographically smallest feasible recipient sequence.
+        self.assertEqual([t["assignee"] for t in result], ["X", "Y"])
+        for ticket, target in zip(result, ("X", "Y")):
+            self.assertEqual(ticket["transfer_history"],
+                             [{"from_assignee": "S", "to_assignee": target,
+                               "reason": "轮 岗", "transferred_at": 10}])
+        again = SupportDesk(self.root)
+        self.assertEqual(again.get("T-1")["assignee"], "X")
+        self.assertEqual(again.get("T-1")["transfer_history"], result[0]["transfer_history"])
+        self.assertEqual(again.get("T-closed")["assignee"], "S")
+        self.assertNotIn("transfer_history", again.get("T-closed"))
+        report = again.assignee_workload_report(10)
+        loads = {group["assignee"]: group["open"] for group in report["groups"]}
+        self.assertEqual(loads, {"X": 2, "Y": 1})
+
+    def test_route_handover_orders_by_priority_time_and_id(self):
+        for ticket_id, priority, opened_at in [("T-low", "low", 1), ("T-untimed", None, None),
+                                               ("T-b", None, 5), ("T-a", None, 5),
+                                               ("T-urgent", "urgent", 9)]:
+            self.app.open_ticket(ticket_id, "A", "a", opened_at=opened_at)
+            self.app.set_category(ticket_id, "c")
+            if priority is not None:
+                self.app.set_priority(ticket_id, priority)
+            self.app.assign(ticket_id, "S")
+        result = self.app.route_handover("S", [{"category": "c", "assignees": ["R"]}], "r", 9, max_open=10)
+        self.assertEqual([t["ticket_id"] for t in result],
+                         ["T-urgent", "T-a", "T-b", "T-untimed", "T-low"])
+
+    def test_route_handover_prefers_lexicographically_smallest_sequence(self):
+        # The spec example: category a can go to X or Y, category b only to X,
+        # both idle with a ceiling of one, so a goes to Y and b goes to X.
+        self.app.open_ticket("T-a", "A", "a", opened_at=1)
+        self.app.set_category("T-a", "a")
+        self.app.assign("T-a", "S")
+        self.app.open_ticket("T-b", "B", "b", opened_at=2)
+        self.app.set_category("T-b", "b")
+        self.app.assign("T-b", "S")
+        rules = [{"category": "a", "assignees": ["Y", "X"]},
+                 {"category": "b", "assignees": ["X"]}]
+        result = self.app.route_handover("S", rules, "r", 5, max_open=1)
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result],
+                         [("T-a", "Y"), ("T-b", "X")])
+        # Rule and name input order do not change the result.
+        self.app.route_handover("X", [{"category": "b", "assignees": ["S"]}], "back", 6)
+        self.app.route_handover("Y", [{"category": "a", "assignees": ["S"]}], "back", 7)
+        again = self.app.route_handover("S", [{"category": "b", "assignees": ["X"]},
+                                              {"category": "a", "assignees": ["X", "Y"]}],
+                                        "r", 8, max_open=1)
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in again],
+                         [("T-a", "Y"), ("T-b", "X")])
+
+    def test_route_handover_shares_capacity_across_rules(self):
+        self.app.open_ticket("T-held", "A", "a")
+        self.app.set_category("T-held", "other")
+        self.app.assign("T-held", "X")
+        self.app.open_ticket("T-1", "B", "b", opened_at=1)
+        self.app.set_category("T-1", "c1")
+        self.app.assign("T-1", "S")
+        self.app.open_ticket("T-2", "C", "c", opened_at=2)
+        self.app.set_category("T-2", "c2")
+        self.app.assign("T-2", "S")
+        rules = [{"category": "c1", "assignees": ["X", "Y"]},
+                 {"category": "c2", "assignees": ["X", "Y"]}]
+        # X already holds one open ticket, so with max_open=2 each recipient
+        # takes exactly one of the two tickets.
+        result = self.app.route_handover("S", rules, "r", 5, max_open=2)
+        self.assertEqual([t["assignee"] for t in result], ["X", "Y"])
+
+    def test_route_handover_capacity_shortfall_rejects_without_changes(self):
+        self.app.open_ticket("T-taken", "A", "a")
+        self.app.assign("T-taken", "X")
+        self.app.open_ticket("T-1", "B", "b")
+        self.app.set_category("T-1", "c")
+        self.app.assign("T-1", "S")
+        self.app.open_ticket("T-2", "C", "c")
+        self.app.set_category("T-2", "c")
+        self.app.assign("T-2", "S")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.route_handover("S", [{"category": "c", "assignees": ["X"]}], "r", 0, max_open=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.get("T-1")["assignee"], "S")
+        self.assertNotIn("transfer_history", self.app.get("T-1"))
+
+    def test_route_handover_missing_rule_rejects_without_backstop(self):
+        self.app.open_ticket("T-net", "A", "a")
+        self.app.set_category("T-net", "network")
+        self.app.assign("T-net", "S")
+        self.app.open_ticket("T-null", "B", "b")
+        self.app.assign("T-null", "S")
+        before = self.app.path.read_bytes()
+        # The null rule covers only uncategorized tickets, never "network".
+        with self.assertRaises(ValueError):
+            self.app.route_handover("S", [{"category": None, "assignees": ["U"]}], "r", 0)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.get("T-net")["assignee"], "S")
+        self.assertEqual(self.app.get("T-null")["assignee"], "S")
+        result = self.app.route_handover("S", [{"category": None, "assignees": ["U"]},
+                                               {"category": "network", "assignees": ["V"]}], "r", 0)
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result],
+                         [("T-net", "V"), ("T-null", "U")])
+
+    def test_route_handover_time_regression_rejected_and_equal_allowed(self):
+        self.app.open_ticket("T-1", "A", "a", opened_at=10)
+        self.app.set_category("T-1", "c")
+        self.app.assign("T-1", "S")
+        self.app.open_ticket("T-2", "B", "b", opened_at=1)
+        self.app.set_category("T-2", "c")
+        self.app.assign("T-2", "X")
+        self.app.transfer_ticket("T-2", "S", "move", 20)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.route_handover("S", [{"category": "c", "assignees": ["R"]}], "r", 9)
+        with self.assertRaises(ValueError):
+            self.app.route_handover("S", [{"category": "c", "assignees": ["R"]}], "r", 19)
+        self.assertEqual(before, self.app.path.read_bytes())
+        result = self.app.route_handover("S", [{"category": "c", "assignees": ["R"]}], "r", 20)
+        self.assertEqual([t["ticket_id"] for t in result], ["T-2", "T-1"])
+        self.assertEqual(len(self.app.get("T-2")["transfer_history"]), 2)
+
+    def test_route_handover_untimed_ticket_skips_time_check_without_backfill(self):
+        self.app.open_ticket("T", "A", "a")
+        self.app.set_category("T", "c")
+        self.app.assign("T", "S")
+        result = self.app.route_handover("S", [{"category": "c", "assignees": ["R"]}], "r", 0)
+        self.assertEqual([t["ticket_id"] for t in result], ["T"])
+        ticket = self.app.get("T")
+        self.assertNotIn("opened_at", ticket)
+        self.assertEqual(ticket["transfer_history"][0]["transferred_at"], 0)
+
+    def test_route_handover_empty_selection_returns_empty_without_creating(self):
+        missing = self.root / "missing"
+        rules = [{"category": "c", "assignees": ["R"]}]
+        self.assertEqual(SupportDesk(missing).route_handover("S", rules, "r", 0), [])
+        self.assertFalse(missing.exists())
+        self.app.open_ticket("T", "A", "a")
+        self.app.set_category("T", "c")
+        self.app.assign("T", "X")
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.route_handover("S", rules, "r", 0), [])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_route_handover_rejects_bad_input_without_writing(self):
+        self.app.open_ticket("T", "A", "a")
+        self.app.set_category("T", "c")
+        self.app.assign("T", "S")
+        good_rules = [{"category": "c", "assignees": ["R"]}]
+        before = self.app.path.read_bytes()
+        for bad_source in (None, "", "  ", 1, ["S"]):
+            with self.assertRaises(ValueError):
+                self.app.route_handover(bad_source, good_rules, "r", 0)
+        for bad_rules in (None, "R", [], {}, [[]], [{"category": "c"}],
+                          [{"category": "c", "assignees": ["R"], "x": 1}],
+                          [{"category": "", "assignees": ["R"]}],
+                          [{"category": 1, "assignees": ["R"]}],
+                          [{"category": "c", "assignees": []}],
+                          [{"category": "c", "assignees": ["R", " R "]}],
+                          [{"category": "c", "assignees": ["R", 1]}],
+                          [{"category": "c", "assignees": ["S"]}],
+                          [{"category": "c", "assignees": ["R", "S"]}],
+                          [{"category": "c", "assignees": ["R"]},
+                           {"category": " C ".lower(), "assignees": ["Q"]}]):
+            with self.assertRaises(ValueError):
+                self.app.route_handover("S", bad_rules, "r", 0)
+        for bad_reason in (None, "", "  ", 1):
+            with self.assertRaises(ValueError):
+                self.app.route_handover("S", good_rules, bad_reason, 0)
+        for bad_time in (-1, True, 1.5, "0", None):
+            with self.assertRaises(ValueError):
+                self.app.route_handover("S", good_rules, "r", bad_time)
+        for bad_cap in (0, -1, True, 1.5, "5", None):
+            with self.assertRaises(ValueError):
+                self.app.route_handover("S", good_rules, "r", 0, bad_cap)
+        with self.assertRaises(TypeError):
+            self.app.route_handover("S", good_rules, "r")
+        with self.assertRaises(TypeError):
+            self.app.route_handover("S", good_rules, "r", 0, unknown=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # All inputs are validated even when no ticket is selected.
+        missing = self.root / "missing"
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).route_handover("S", [], "r", 0)
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).route_handover("S", good_rules, "r", -1)
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).route_handover("S", [{"category": "c", "assignees": ["S"]}], "r", 0)
+        self.assertFalse(missing.exists())
+
+    def test_route_handover_keeps_other_fields_and_appends_history(self):
+        self.app.open_ticket("T", "A", "a", opened_at=1)
+        self.app.set_category("T", "billing")
+        self.app.assign("T", "S")
+        self.app.set_priority("T", "high")
+        self.app.note("T", "checked")
+        self.app.respond("T", "hello", 2)
+        result = self.app.route_handover("S", [{"category": "billing", "assignees": ["R"]}], "r", 5)
+        ticket = result[0]
+        self.assertEqual(ticket["priority"], "high")
+        self.assertEqual(ticket["category"], "billing")
+        self.assertEqual(ticket["notes"], ["checked"])
+        self.assertEqual(ticket["first_response"], {"message": "hello", "responded_at": 2})
+        again = self.app.route_handover("R", [{"category": "billing", "assignees": ["S"]}], "back", 5)
+        self.assertEqual([t["ticket_id"] for t in again], ["T"])
+        history = self.app.get("T")["transfer_history"]
+        self.assertEqual([(h["from_assignee"], h["to_assignee"]) for h in history],
+                         [("S", "R"), ("R", "S")])
+
+    def test_cli_route_handover(self):
+        self.app.open_ticket("T-1", "A", "a", opened_at=1)
+        self.app.set_category("T-1", "c")
+        self.app.assign("T-1", "S")
+        self.app.open_ticket("T-2", "B", "b", opened_at=2)
+        self.app.set_category("T-2", "c")
+        self.app.assign("T-2", "S")
+        payload = self.root / "input.json"
+        payload.write_text(json.dumps({"source_assignee": "S",
+                                       "rules": [{"category": "c", "assignees": ["R"]}],
+                                       "reason": "r", "transferred_at": 5}),
+                           encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "route-handover", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([t["ticket_id"] for t in value], ["T-1", "T-2"])
+        self.assertEqual([t["assignee"] for t in value], ["R", "R"])
+        payload.write_text(json.dumps({"source_assignee": "R",
+                                       "rules": [{"category": "c", "assignees": ["R"]}],
+                                       "reason": "r", "transferred_at": 5}),
+                           encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "route-handover", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
     def _received_ticket(self, ticket_id, opened_at=0):
         self.app.open_ticket(ticket_id, "Alice", "A", opened_at=opened_at)
         return ticket_id
