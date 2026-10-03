@@ -4590,5 +4590,123 @@ class ProductTests(unittest.TestCase):
         # the first row committed before the second row failed
         self.assertEqual(SupportDesk(self.root).get("T-3")["category"], "hardware")
 
+    def test_close_many_closes_group_in_input_order(self):
+        self.app.open_ticket("T-1", "A", "S1", opened_at=5)
+        self.app.assign("T-1", "Bob")
+        self.app.open_ticket("T-2", "B", "S2")
+        self.app.assign("T-2", "Eve")
+        value = self.app.close_many([
+            {"ticket_id": " T-2 ", "resolution": " done\nlater ", "closed_at": None},
+            {"ticket_id": "T-1", "resolution": "fixed", "closed_at": 9},
+        ])
+        self.assertEqual([ticket["ticket_id"] for ticket in value], ["T-2", "T-1"])
+        self.assertTrue(all(ticket["status"] == "closed" for ticket in value))
+        self.assertEqual(value[0]["resolution"], "done\nlater")
+        self.assertNotIn("closed_at", value[0])
+        self.assertEqual(value[1]["closed_at"], 9)
+        reloaded = SupportDesk(self.root)
+        self.assertEqual(reloaded.get("T-1")["resolution"], "fixed")
+        self.assertEqual(reloaded.list_tickets("open"), [])
+
+    def test_close_many_rejects_bad_items_without_partial_close(self):
+        self.app.open_ticket("T-1", "A", "S")
+        self.app.assign("T-1", "Bob")
+        self.app.open_ticket("T-2", "B", "S")
+        with self.assertRaises(TypeError):
+            self.app.close_many()
+        with self.assertRaises(TypeError):
+            self.app.close_many(items=[{"ticket_id": "T-1", "resolution": "x"}], bogus=1)
+        bad_items = [
+            [], "x", ["x"],
+            [{"ticket_id": "T-1"}],
+            [{"resolution": "x"}],
+            [{"ticket_id": "T-1", "resolution": "x", "z": 1}],
+            [{"ticket_id": "  ", "resolution": "x"}],
+            [{"ticket_id": "T-1", "resolution": "  "}],
+            [{"ticket_id": 1, "resolution": "x"}],
+            [{"ticket_id": "T-1", "resolution": "x", "closed_at": True}],
+            [{"ticket_id": "T-1", "resolution": "x", "closed_at": 1.5}],
+            [{"ticket_id": "T-1", "resolution": "x", "closed_at": "1"}],
+            [{"ticket_id": "T-1", "resolution": "x", "closed_at": -1}],
+            [{"ticket_id": "missing", "resolution": "x"}],
+            [{"ticket_id": "T-2", "resolution": "x"}],
+            [{"ticket_id": "T-1", "resolution": "a"}, {"ticket_id": " T-1 ", "resolution": "b"}],
+        ]
+        for items in bad_items:
+            with self.assertRaises(ValueError, msg=items):
+                self.app.close_many(items)
+        self.assertEqual(self.app.get("T-1")["status"], "open")
+        self.assertEqual(self.app.get("T-2")["status"] == "open", True)
+
+    def test_close_many_atomic_when_last_item_invalid(self):
+        self.app.open_ticket("T-1", "A", "S", opened_at=10)
+        self.app.assign("T-1", "Bob")
+        self.app.open_ticket("T-2", "B", "S", opened_at=20)
+        self.app.assign("T-2", "Eve")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.close_many([
+                {"ticket_id": "T-1", "resolution": "ok", "closed_at": 10},
+                {"ticket_id": "T-2", "resolution": "ok", "closed_at": 19},
+            ])
+        self.assertEqual(self.app.path.read_bytes(), before)
+        self.assertEqual(self.app.get("T-1")["status"], "open")
+        self.assertEqual(self.app.get("T-2")["status"], "open")
+
+    def test_close_many_preserves_histories_and_empty_store_creates_nothing(self):
+        self.app.open_ticket("T-1", "A", "S", opened_at=5)
+        self.app.assign("T-1", "Bob")
+        self.app.respond("T-1", "hi", 6)
+        self.app.receive("T-1", "again", 7)
+        self.app.transfer_ticket("T-1", "Eve", "handoff", 8)
+        self.app.open_ticket("T-2", "B", "S2")
+        self.app.assign("T-2", "Gus")
+        self.app.close("T-2", "first", 10)
+        self.app.reopen_ticket("T-2", "more work")
+        value = self.app.close_many([
+            {"ticket_id": "T-1", "resolution": "done", "closed_at": 8},
+            {"ticket_id": "T-2", "resolution": "again", "closed_at": 10},
+        ])
+        self.assertEqual(value[0]["transfer_history"][0]["transferred_at"], 8)
+        self.assertEqual(value[1]["reopen_history"][0]["closed_at"], 10)
+        self.assertEqual(value[1]["resolution"], "again")
+        missing = self.root / "fresh"
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).close_many([{"ticket_id": "X", "resolution": "x"}])
+        self.assertFalse(missing.exists())
+
+    def test_cli_close_many_and_independent_batches(self):
+        self.app.open_ticket("T-1", "A", "S")
+        self.app.assign("T-1", "Bob")
+        self.app.open_ticket("T-2", "B", "S")
+        self.app.assign("T-2", "Eve")
+        self.app.open_ticket("T-3", "C", "S")
+        self.app.assign("T-3", "Ivy")
+        payload = self.root / "items.json"
+        payload.write_text(json.dumps({"items": [
+            {"ticket_id": "T-1", "resolution": "done", "closed_at": 3},
+            {"ticket_id": "T-2", "resolution": "also"},
+        ]}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "close-many", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([ticket["ticket_id"] for ticket in value], ["T-1", "T-2"])
+        self.assertEqual(value[0]["closed_at"], 3)
+        self.assertNotIn("closed_at", value[1])
+        # outer array: each object is an independent batch
+        payload.write_text(json.dumps([
+            {"items": [{"ticket_id": "T-3", "resolution": "x"}]},
+            {"items": [{"ticket_id": "missing", "resolution": "y"}]},
+        ]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "close-many", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(SupportDesk(self.root).get("T-3")["status"], "closed")
+
 if __name__ == "__main__":
     unittest.main()
