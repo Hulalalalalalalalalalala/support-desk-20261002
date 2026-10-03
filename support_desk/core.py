@@ -186,6 +186,23 @@ def _service_minutes(periods, start, end):
     return total
 
 
+def _due_minute(opened_at, target, periods):
+    # Earliest simulated minute at which the accumulated wait reaches the target.
+    # periods is None for natural minutes, otherwise a merged list of
+    # half-open covered intervals; an endpoint minute counts once reached.
+    if periods is None:
+        return opened_at + target
+    covered = 0
+    for left, right in periods:
+        if right <= opened_at:
+            continue
+        start = max(left, opened_at)
+        covered += right - start
+        if covered >= target:
+            return right - (covered - target)
+    return None
+
+
 class SupportDesk(JsonStore):
     def open_ticket(self, ticket_id, customer, subject, opened_at=None):
         ticket_id, customer, subject = text(ticket_id, "ticket_id"), text(customer, "customer"), text(subject, "subject")
@@ -937,6 +954,58 @@ class SupportDesk(JsonStore):
             rate = counts["on_time"] / counts["responded"] if counts["responded"] else None
             groups.append({"priority": priority, "target_minutes": target, **counts, "on_time_rate": rate})
         return {"as_of": as_of, "groups": groups}
+
+    def response_target_queue(self, as_of, targets=None, service_periods=None):
+        # Parameters are validated even when the store holds no data.
+        as_of = minute(as_of, "as_of")
+        target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
+        if targets is not None:
+            if not isinstance(targets, dict):
+                raise ValueError("targets must be an object or null")
+            for priority, value in targets.items():
+                if priority not in PRIORITY_RANK:
+                    raise ValueError("targets has an unknown priority: " + str(priority))
+                target_minutes[priority] = positive(value, "targets." + priority)
+        periods = _service_periods(service_periods)
+        items = []
+        untimed = 0
+        for ticket in self._read().get("tickets", {}).values():
+            # Only open tickets still awaiting their first response take part:
+            # missing, null or an empty object means no response, while closed
+            # and responded tickets are excluded without any future-time check.
+            if ticket["status"] != "open":
+                continue
+            response = ticket.get("first_response")
+            if isinstance(response, dict) and response:
+                continue
+            if "opened_at" not in ticket:
+                untimed += 1
+                continue
+            opened_at = ticket["opened_at"]
+            if opened_at > as_of:
+                raise ValueError("opened_at must not be later than as_of")
+            priority = ticket.get("priority", "normal")
+            target = target_minutes[priority]
+            if periods is None:
+                waiting = as_of - opened_at
+            else:
+                waiting = _service_minutes(periods, opened_at, as_of)
+            due_at = _due_minute(opened_at, target, periods)
+            # Only a strictly larger accumulated wait is overdue; equal is on time.
+            overdue = waiting > target
+            items.append({"ticket": ticket, "waiting_minutes": waiting,
+                          "due_at": due_at, "overdue": overdue,
+                          "_priority": priority})
+        # Overdue tickets first, then urgent/high/normal/low, then the due minute
+        # ascending with null last, finally the case-sensitive ticket id.
+        items.sort(key=lambda item: (not item["overdue"],
+                                     PRIORITY_RANK[item["_priority"]],
+                                     item["due_at"] is None,
+                                     item["due_at"] if item["due_at"] is not None else 0,
+                                     item["ticket"]["ticket_id"]))
+        for item in items:
+            del item["_priority"]
+        return {"untimed": untimed, "items": items}
 
     def assignee_workload_report(self, as_of, response_minutes=30, follow_up_minutes=60):
         as_of = minute(as_of, "as_of")
