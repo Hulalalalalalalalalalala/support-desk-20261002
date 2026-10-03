@@ -754,6 +754,68 @@ class SupportDesk(JsonStore):
         return {"ticket_id": ticket_id, "article_id": article_id,
                 "reviewed_count": len(references)}
 
+    def _pending_stale_references(self, data, ticket, entry, article_id, stale=None):
+        reviews = data.get("knowledge_reviews", {})
+        current = {"title": entry["title"], "content": entry["content"]}
+        confirmations = reviews.get(ticket["ticket_id"], {}).get(article_id, {})
+        if stale is None:
+            stale = self._stale_references(ticket, entry, article_id)
+        return [reference for reference in stale
+                if confirmations.get(self._review_key(reference)) != current]
+
+    def correct_knowledge(self, article_id, ticket_ids, replied_at):
+        article_id = text(article_id, "article_id")
+        if not isinstance(ticket_ids, list) or not ticket_ids:
+            raise ValueError("ticket_ids must be a nonempty array")
+        ids = []
+        for element in ticket_ids:
+            if not isinstance(element, str) or not element.strip():
+                raise ValueError("ticket_ids elements must be nonblank strings")
+            ids.append(element.strip())
+        if len(set(ids)) != len(ids):
+            raise ValueError("ticket_ids must not contain duplicate ticket ids")
+        replied_at = minute(replied_at, "replied_at")
+        data = self._read()
+        entry = data.get("knowledge", {}).get(article_id)
+        if entry is None:
+            raise ValueError("unknown knowledge article")
+        if not data.get("knowledge_enabled", {}).get(article_id, True):
+            raise ValueError("knowledge article is disabled")
+        tickets = data.get("tickets", {})
+        selected = []
+        for ticket_id in ids:
+            ticket = tickets.get(ticket_id)
+            if ticket is None or ticket["status"] != "open":
+                raise ValueError("ticket must exist and be open")
+            if "opened_at" not in ticket:
+                raise ValueError("ticket has no opened_at")
+            response = ticket.get("first_response")
+            if not isinstance(response, dict) or not response:
+                raise ValueError("ticket has no first response")
+            # At least one stale reference to this article must not yet have been
+            # confirmed against the article's current title/content.
+            stale = self._stale_references(ticket, entry, article_id)
+            if not self._pending_stale_references(data, ticket, entry, article_id, stale):
+                raise ValueError("ticket has no unconfirmed stale reference")
+            self._check_reply_time(ticket, replied_at)
+            selected.append((ticket, stale))
+        snapshot = dict(entry)
+        current = {"title": entry["title"], "content": entry["content"]}
+        reviews = data.setdefault("knowledge_reviews", {})
+        for ticket, stale in selected:
+            ticket.setdefault("replies", []).append({
+                "message": entry["content"],
+                "replied_at": replied_at,
+                "knowledge": snapshot,
+            })
+            # The correction confirms every stale reference that existed before it,
+            # so the ticket leaves the pending review queue for the current content.
+            confirmations = reviews.setdefault(ticket["ticket_id"], {}).setdefault(article_id, {})
+            for reference in stale:
+                confirmations[self._review_key(reference)] = dict(current)
+        self._write(data)
+        return [ticket for ticket, _ in selected]
+
     def knowledge_review_queue(self, article_id, offset=0, limit=20, pending_only=False):
         article_id = text(article_id, "article_id")
         # bool is a subclass of int, so compare types explicitly; floats and strings are rejected too.
