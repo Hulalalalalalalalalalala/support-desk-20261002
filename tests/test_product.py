@@ -3501,5 +3501,211 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.stdout, "")
         self.assertIn("error", json.loads(failed.stderr))
 
+    def test_escalate_overdue_first_response_wait_and_strict_boundary(self):
+        self._received_ticket("T-9", 9)    # 40 - 9 = 31 > 30
+        self._received_ticket("T-10", 10)  # 30 == 30
+        self._received_ticket("T-40", 40)  # 0
+        escalated = self.app.escalate_overdue(40)
+        self.assertEqual([t["ticket_id"] for t in escalated], ["T-9"])
+        self.assertEqual(escalated[0], self.app.get("T-9"))
+        self.assertEqual(self.app.get("T-9")["priority"], "urgent")
+        self.assertEqual(self.app.get("T-10").get("priority", "normal"), "normal")
+        self.assertEqual(self.app.get("T-40").get("priority", "normal"), "normal")
+
+    def test_escalate_overdue_uses_custom_response_target(self):
+        self._received_ticket("T", 0)
+        self.assertEqual([t["ticket_id"] for t in self.app.escalate_overdue(10, response_minutes=10)], [])
+        self.assertEqual([t["ticket_id"] for t in self.app.escalate_overdue(11, response_minutes=10)], ["T"])
+
+    def test_escalate_overdue_null_and_empty_first_response_are_pending(self):
+        self._received_ticket("T-null", 0)
+        self._received_ticket("T-empty", 0)
+        data = self.app._read()
+        data["tickets"]["T-null"]["first_response"] = None
+        data["tickets"]["T-empty"]["first_response"] = {}
+        self.app._write(data)
+        self.assertEqual([t["ticket_id"] for t in self.app.escalate_overdue(31)],
+                         ["T-empty", "T-null"])
+
+    def test_escalate_overdue_skips_untimed_closed_and_unassigned_independent(self):
+        self.app.open_ticket("T-untimed", "Alice", "A")
+        self._received_ticket("T-closed", 0)
+        self.app.assign("T-closed", "Eve")
+        self.app.close("T-closed", "Done")
+        self._received_ticket("T-open", 0)
+        escalated = self.app.escalate_overdue(31)
+        self.assertEqual([t["ticket_id"] for t in escalated], ["T-open"])
+        self.assertNotIn("priority", self.app.get("T-untimed"))
+
+    def test_escalate_overdue_customer_followups_boundary_and_earliest_wait(self):
+        self._received_ticket("T", 0)
+        self.app.respond("T", "first", 10)
+        self.app.receive("T", "q-covered", 10)   # same minute as an answer: covered
+        self.app.receive("T", "q-later", 20)
+        self.app.reply("T", "second", 30)
+        self.app.receive("T", "q-same", 30)      # covered by the reply
+        self.app.receive("T", "q-open", 31)      # earliest unanswered
+        self.app.receive("T", "q-dup", 31)       # duplicate time does not change the rule
+        escalated = self.app.escalate_overdue(61)  # 61 - 31 = 30 == 30
+        self.assertEqual(escalated, [])
+        escalated = self.app.escalate_overdue(62)  # 31 > 30
+        self.assertEqual([t["ticket_id"] for t in escalated], ["T"])
+
+    def test_escalate_overdue_without_answers_all_followups_unanswered(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "one", 5)
+        self.app.receive("T", "two", 8)
+        escalated = self.app.escalate_overdue(36, customer_minutes=30)  # 36 - 5 = 31
+        self.assertEqual([t["ticket_id"] for t in escalated], ["T"])
+
+    def test_escalate_overdue_uses_custom_customer_target(self):
+        self._received_ticket("T", 0)
+        self.app.respond("T", "r", 0)
+        self.app.receive("T", "q", 10)
+        self.assertEqual(self.app.escalate_overdue(20, customer_minutes=10), [])
+        self.assertEqual([t["ticket_id"] for t in self.app.escalate_overdue(21, customer_minutes=10)], ["T"])
+
+    def test_escalate_overdue_both_kinds_processed_once_and_sorted_case_sensitively(self):
+        self._received_ticket("t-b", 0)  # pending first response
+        self._received_ticket("T-A", 0)
+        self.app.respond("T-A", "r", 1)
+        self.app.receive("T-A", "q", 2)
+        self._received_ticket("T-both", 0)
+        self.app.respond("T-both", "r", 1)
+        self.app.receive("T-both", "q", 2)
+        escalated = self.app.escalate_overdue(40)
+        self.assertEqual([t["ticket_id"] for t in escalated], ["T-A", "T-both", "t-b"])
+        self.assertEqual(len({id(t) for t in escalated}), 3)
+
+    def test_escalate_overdue_excludes_already_urgent_but_still_checks_them(self):
+        self._received_ticket("T-urgent", 0)
+        self.app.set_priority("T-urgent", "urgent")
+        self.assertEqual(self.app.escalate_overdue(40), [])
+        # an already-urgent ticket with a future follow-up still invalidates the call
+        self.app.receive("T-urgent", "q", 45)
+        with self.assertRaises(ValueError):
+            self.app.escalate_overdue(40)
+
+    def test_escalate_overdue_persists_and_feeds_priority_workflows(self):
+        self._received_ticket("T", 0)
+        self.app.escalate_overdue(31)
+        reloaded = SupportDesk(self.root)
+        self.assertEqual(reloaded.get("T")["priority"], "urgent")
+        queue = [(i["priority"], i["ticket"]["ticket_id"]) for i in reloaded.priority_queue()]
+        self.assertEqual(queue[0], ("urgent", "T"))
+        # assignment orders the escalated ticket ahead of an older normal ticket
+        reloaded.open_ticket("T-low", "Bob", "B", opened_at=0)
+        assigned = reloaded.auto_assign(["Zoe"])["assigned"]
+        self.assertEqual([t["ticket_id"] for t in assigned], ["T", "T-low"])
+
+    def test_escalate_overdue_changes_only_priority_and_preserves_knowledge(self):
+        self._received_ticket("SRC", 0)
+        self.app.assign("SRC", "Eve")
+        self.app.close("SRC", "article body")
+        self.app.publish_knowledge("KB", "SRC")
+        self._received_ticket("T", 0)
+        self.app.respond_with_knowledge("T", "KB", responded_at=5)
+        self.app.receive("T", "q", 10)
+        before = self.app.get("T")
+        self.app.escalate_overdue(41)
+        after = self.app.get("T")
+        self.assertEqual(after["priority"], "urgent")
+        for key, value in before.items():
+            if key != "priority":
+                self.assertEqual(after[key], value, key)
+        self.assertEqual(self.app.search_knowledge("article")[0]["article_id"], "KB")
+        self.assertEqual(after["notes"], [])
+
+    def test_escalate_overdue_no_change_writes_nothing_and_creates_no_files(self):
+        # nothing to escalate: empty store returns [] and creates no directory or file
+        missing = self.root / "missing"
+        self.assertEqual(SupportDesk(missing).escalate_overdue(0), [])
+        self.assertFalse(missing.exists())
+        # a populated store with no overdue ticket is not rewritten either
+        self._received_ticket("T", 0)
+        before = self.app.path.read_bytes()
+        self.assertEqual(self.app.escalate_overdue(30), [])
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.app.escalate_overdue(31)
+        before = self.app.path.read_bytes()
+        self.assertEqual(SupportDesk(self.root).escalate_overdue(100), [])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_escalate_overdue_rejects_future_times_without_partial_changes(self):
+        self._received_ticket("T-future-opened", 50)
+        self._received_ticket("T-ready", 0)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.escalate_overdue(40)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.get("T-ready").get("priority", "normal"), "normal")
+        # future customer follow-up
+        self._received_ticket("T-msg", 0)
+        self.app.respond("T-msg", "r", 5)
+        self.app.receive("T-msg", "q", 45)
+        with self.assertRaises(ValueError):
+            self.app.escalate_overdue(40)
+        # future answer of a ticket that also has follow-ups
+        self._received_ticket("T-ans", 0)
+        self.app.receive("T-ans", "q", 5)
+        self.app.respond("T-ans", "r", 45)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.escalate_overdue(40)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_escalate_overdue_bad_arguments(self):
+        for as_of in (True, 1.5, "40", None, -1):
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.escalate_overdue(as_of)
+        for target in (0, -5, True, 30.0, "30", None):
+            with self.assertRaises(ValueError, msg=target):
+                self.app.escalate_overdue(40, response_minutes=target)
+            with self.assertRaises(ValueError, msg=target):
+                self.app.escalate_overdue(40, customer_minutes=target)
+        with self.assertRaises(TypeError):
+            self.app.escalate_overdue()
+        with self.assertRaises(TypeError):
+            self.app.escalate_overdue(40, bogus=1)
+
+    def test_other_operations_do_not_auto_escalate(self):
+        self._received_ticket("T", 0)
+        self.app.response_queue(100)
+        self.app.customer_queue(100)
+        self.app.response_stats()
+        self.app.priority_queue()
+        self.assertEqual(self.app.get("T").get("priority", "normal"), "normal")
+
+    def test_cli_escalate_overdue_object_and_array(self):
+        self._received_ticket("T-1", 0)
+        self._received_ticket("T-2", 0)
+        payload = self.root / "escalate.json"
+        payload.write_text(json.dumps({"as_of": 31}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "priority-escalate", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([t["ticket_id"] for t in json.loads(result.stdout)], ["T-1", "T-2"])
+        # array rows run independently: the second row escalates nothing but still succeeds
+        payload.write_text(json.dumps([
+            {"as_of": 100},
+            {"as_of": 0, "response_minutes": 1, "customer_minutes": 1},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "priority-escalate", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [[], []])
+        # a failing row exits 2; earlier successful rows in the same batch remain
+        self._received_ticket("T-3", 0)
+        payload.write_text(json.dumps([{"as_of": 31}, {"as_of": -1}]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "priority-escalate", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(SupportDesk(self.root).get("T-3")["priority"], "urgent")
+
 if __name__ == "__main__":
     unittest.main()

@@ -183,6 +183,52 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
+    def escalate_overdue(self, as_of, response_minutes=30, customer_minutes=30):
+        as_of = minute(as_of, "as_of")
+        response_minutes = positive(response_minutes, "response_minutes")
+        customer_minutes = positive(customer_minutes, "customer_minutes")
+        data = self._read()
+        selected = []
+        # All time validation runs before any priority change, so a future
+        # record rejects the whole call without leaving partial escalations.
+        for ticket in data.get("tickets", {}).values():
+            if ticket["status"] != "open":
+                continue
+            response = ticket.get("first_response")
+            has_response = isinstance(response, dict) and bool(response)
+            if not has_response and "opened_at" in ticket:
+                if ticket["opened_at"] > as_of:
+                    raise ValueError("opened_at must not be later than as_of")
+            messages = ticket.get("customer_messages")
+            if messages:
+                answer_times = ([response["responded_at"]] if has_response else [])
+                answer_times.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
+                if any(message["received_at"] > as_of for message in messages) or \
+                        any(time > as_of for time in answer_times):
+                    raise ValueError("customer message or response time must not be later than as_of")
+            overdue = False
+            if not has_response:
+                # Missing, null or an empty object means the ticket still awaits
+                # its first response; tickets without opened_at do not take part.
+                if "opened_at" in ticket and as_of - ticket["opened_at"] > response_minutes:
+                    overdue = True
+            if not overdue and messages:
+                # The answer boundary is the latest of the first response and all
+                # later replies; a follow-up in the same minute is already covered.
+                boundary = max(answer_times) if answer_times else None
+                unanswered = [message["received_at"] for message in messages
+                              if boundary is None or message["received_at"] > boundary]
+                if unanswered and as_of - min(unanswered) > customer_minutes:
+                    overdue = True
+            if overdue and ticket.get("priority") != "urgent":
+                selected.append(ticket)
+        selected.sort(key=lambda ticket: ticket["ticket_id"])
+        for ticket in selected:
+            ticket["priority"] = "urgent"
+        if selected:
+            self._write(data)
+        return selected
+
     def respond(self, ticket_id, message, responded_at):
         ticket_id, message = text(ticket_id, "ticket_id"), text(message, "message")
         responded_at = minute(responded_at, "responded_at")
