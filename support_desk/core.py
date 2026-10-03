@@ -430,6 +430,56 @@ class SupportDesk(JsonStore):
                  "overdue": waiting > target_minutes}
                 for earliest, ticket, count, waiting in entries]
 
+    def escalate_overdue(self, as_of, response_minutes=30, customer_minutes=30):
+        as_of = minute(as_of, "as_of")
+        response_minutes = positive(response_minutes, "response_minutes")
+        customer_minutes = positive(customer_minutes, "customer_minutes")
+        data = self._read()
+        tickets = data.get("tickets", {})
+        overdue = set()
+        for ticket in tickets.values():
+            if ticket["status"] != "open":
+                continue
+            response = ticket.get("first_response")
+            # Missing, null or an empty object means there is no first response.
+            has_response = isinstance(response, dict) and bool(response)
+            if not has_response:
+                opened_at = ticket.get("opened_at")
+                # Tickets without a registration time never join this escalation.
+                if opened_at is not None:
+                    if opened_at > as_of:
+                        raise ValueError("opened_at must not be later than as_of")
+                    if as_of - opened_at > response_minutes:
+                        overdue.add(ticket["ticket_id"])
+            messages = ticket.get("customer_messages")
+            # Only open tickets with a follow-up history participate.
+            if messages:
+                answer_times = ([response["responded_at"]] if has_response else [])
+                answer_times.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
+                # Any follow-up or answer later than as_of invalidates the whole call.
+                if any(message["received_at"] > as_of for message in messages) or \
+                        any(time > as_of for time in answer_times):
+                    raise ValueError("customer message or response time must not be later than as_of")
+                boundary = max(answer_times) if answer_times else None
+                # A follow-up in the same minute as an answer is already covered;
+                # only strictly later times remain unanswered.
+                unanswered = [message for message in messages
+                              if boundary is None or message["received_at"] > boundary]
+                if unanswered:
+                    earliest = min(message["received_at"] for message in unanswered)
+                    if as_of - earliest > customer_minutes:
+                        overdue.add(ticket["ticket_id"])
+        escalated = []
+        for ticket_id in sorted(overdue):
+            ticket = tickets[ticket_id]
+            if ticket.get("priority", "normal") == "urgent":
+                continue
+            ticket["priority"] = "urgent"
+            escalated.append(ticket)
+        if escalated:
+            self._write(data)
+        return escalated
+
     def customer_response_report(self, as_of):
         as_of = minute(as_of, "as_of")
         tickets = list(self._read().get("tickets", {}).values())
