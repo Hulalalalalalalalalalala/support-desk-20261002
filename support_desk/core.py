@@ -5,6 +5,144 @@ PRIORITY_RANK = {name: index for index, name in enumerate(PRIORITIES)}
 
 _UNSET = object()
 
+
+class _Edge:
+    __slots__ = ("to", "rev", "cap")
+
+    def __init__(self, to, rev, cap):
+        self.to, self.rev, self.cap = to, rev, cap
+
+
+def _route_coverage(candidates, rule_by_category, loads, max_open):
+    # Choose a globally feasible plan maximizing the number of assigned tickets.
+    # Residual flow decides feasibility of each tentative decision; rerouting
+    # through reverse edges lets an earlier ticket keep an undecided recipient.
+    capacities = {name: max_open - load for name, load in loads.items() if load < max_open}
+    options = []
+    for ticket in candidates:
+        names = rule_by_category.get(ticket.get("category"))
+        options.append(sorted(name for name in (names or ()) if name in capacities))
+    n = len(candidates)
+
+    def run(forced, free, caps):
+        # Maximum flow with every ticket in forced carrying one unit (to any
+        # eligible assignee); tickets in free stay optional. Returns the flow
+        # value, or -1 when a forced ticket cannot be saturated.
+        ticket_ids = sorted(set(forced) | set(free))
+        if not ticket_ids:
+            return 0
+        assignee_ids = sorted({name for idx in ticket_ids for name in options[idx]
+                               if caps.get(name, 0) > 0})
+        ticket_node = {idx: 1 + pos for pos, idx in enumerate(ticket_ids)}
+        assignee_node = {name: 1 + len(ticket_ids) + pos
+                         for pos, name in enumerate(assignee_ids)}
+        sink = 1 + len(ticket_ids) + len(assignee_ids)
+        graph = [[] for _ in range(sink + 1)]
+
+        def add_edge(head, tail, cap):
+            graph[head].append(_Edge(tail, len(graph[tail]), cap))
+            graph[tail].append(_Edge(head, len(graph[head]) - 1, 0))
+
+        source_edges = {}
+        for idx in ticket_ids:
+            edge = _Edge(ticket_node[idx], len(graph[ticket_node[idx]]), 1)
+            graph[0].append(edge)
+            graph[ticket_node[idx]].append(_Edge(0, len(graph[0]) - 1, 0))
+            source_edges[idx] = edge
+            for name in options[idx]:
+                if caps.get(name, 0) > 0:
+                    add_edge(ticket_node[idx], assignee_node[name], 1)
+        for name in assignee_ids:
+            add_edge(assignee_node[name], sink, caps[name])
+
+        total = 0
+
+        def push_from(idx):
+            # Find a residual path from this ticket node to the sink, then feed
+            # it one unit from the source. Backward assignee->ticket edges may
+            # reroute already matched tickets without dropping their unit.
+            start = ticket_node[idx]
+            parents = {start: None}
+            queue = [start]
+            for node in queue:
+                for edge in graph[node]:
+                    # Never climb back into the source: a forced ticket keeps its
+                    # unit; only assignee->ticket reverse edges may reroute it.
+                    if edge.cap > 0 and edge.to != 0 and edge.to not in parents:
+                        parents[edge.to] = (node, edge)
+                        queue.append(edge.to)
+            if sink not in parents:
+                return False
+            node = sink
+            while node != start:
+                prev, edge = parents[node]
+                edge.cap -= 1
+                graph[node][edge.rev].cap += 1
+                node = prev
+            source_edges[idx].cap = 0
+            graph[start][source_edges[idx].rev].cap = 1
+            return True
+
+        pending = list(forced)
+        # Push forced tickets one at a time; a ticket that cannot be routed now
+        # may succeed after another forced ticket triggers a reroute chain.
+        while pending:
+            stuck = True
+            rest = []
+            for idx in pending:
+                if push_from(idx):
+                    total += 1
+                    stuck = False
+                else:
+                    rest.append(idx)
+            if stuck:
+                return -1
+            pending = rest
+        while True:
+            parents = {0: None}
+            queue = [0]
+            for node in queue:
+                for edge in graph[node]:
+                    if edge.cap > 0 and edge.to not in parents:
+                        parents[edge.to] = (node, edge)
+                        queue.append(edge.to)
+            if sink not in parents:
+                break
+            node = sink
+            while node != 0:
+                prev, edge = parents[node]
+                edge.cap -= 1
+                graph[node][edge.rev].cap += 1
+                node = prev
+            total += 1
+        return total
+
+    maximum = run([], range(n), capacities)
+    bits = [False] * n
+    for i in range(n):
+        forced = [j for j in range(i) if bits[j]] + [i]
+        if run(forced, range(i + 1, n), capacities) == maximum:
+            bits[i] = True
+    choices = [None] * n
+    remaining_caps = dict(capacities)
+    assigned_count = 0
+    for i in range(n):
+        if not bits[i]:
+            continue
+        for name in options[i]:
+            if remaining_caps[name] <= 0:
+                continue
+            remaining_caps[name] -= 1
+            required = maximum - assigned_count - 1
+            forced = [j for j in range(i + 1, n) if bits[j]]
+            if run(forced, [], remaining_caps) == required:
+                choices[i] = name
+                assigned_count += 1
+                break
+            remaining_caps[name] += 1
+    return choices
+
+
 class SupportDesk(JsonStore):
     def open_ticket(self, ticket_id, customer, subject, opened_at=None):
         ticket_id, customer, subject = text(ticket_id, "ticket_id"), text(customer, "customer"), text(subject, "subject")
@@ -926,7 +1064,9 @@ class SupportDesk(JsonStore):
                      if ticket["ticket_id"] not in assigned_ids]
         return {"assigned": assigned, "remaining": remaining}
 
-    def route_assign(self, rules, max_open=5):
+    def route_assign(self, rules, max_open=5, strategy="greedy"):
+        if strategy not in ("greedy", "coverage"):
+            raise ValueError("strategy must be greedy or coverage")
         if not isinstance(rules, list) or not rules:
             raise ValueError("rules must be a nonempty array")
         normalized = []
@@ -976,20 +1116,32 @@ class SupportDesk(JsonStore):
                             key=candidate_key)
         assigned = []
         assigned_ids = set()
-        for ticket in candidates:
-            # Each ticket uses only the rule for its exact category; the
-            # uncategorized rule never backstops a categorized ticket.
-            names = rule_by_category.get(ticket.get("category"))
-            if names is None:
-                continue
-            available = [name for name in names if loads[name] < max_open]
-            if not available:
-                continue
-            chosen = min(available, key=lambda name: (loads[name], name))
-            ticket["assignee"] = chosen
-            loads[chosen] += 1
-            assigned.append(ticket)
-            assigned_ids.add(ticket["ticket_id"])
+        if strategy == "greedy":
+            for ticket in candidates:
+                # Each ticket uses only the rule for its exact category; the
+                # uncategorized rule never backstops a categorized ticket.
+                names = rule_by_category.get(ticket.get("category"))
+                if names is None:
+                    continue
+                available = [name for name in names if loads[name] < max_open]
+                if not available:
+                    continue
+                chosen = min(available, key=lambda name: (loads[name], name))
+                ticket["assignee"] = chosen
+                loads[chosen] += 1
+                assigned.append(ticket)
+                assigned_ids.add(ticket["ticket_id"])
+        else:
+            # Pick the global plan with the most assignments; ties prefer
+            # assigning the earlier candidate, then the lexicographically
+            # smallest recipient sequence in candidate order.
+            choices = _route_coverage(candidates, rule_by_category, loads, max_open)
+            for ticket, chosen in zip(candidates, choices):
+                if chosen is None:
+                    continue
+                ticket["assignee"] = chosen
+                assigned.append(ticket)
+                assigned_ids.add(ticket["ticket_id"])
         if assigned:
             self._write(data)
         remaining = [ticket["ticket_id"] for ticket in candidates
