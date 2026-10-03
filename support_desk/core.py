@@ -6,6 +6,14 @@ PRIORITY_RANK = {name: index for index, name in enumerate(PRIORITIES)}
 _UNSET = object()
 
 
+def _first_response_of(ticket):
+    # Missing, null or an empty object means there is no first response.
+    response = ticket.get("first_response")
+    if isinstance(response, dict) and response:
+        return response
+    return None
+
+
 class _Edge:
     __slots__ = ("to", "rev", "cap")
 
@@ -378,7 +386,7 @@ class SupportDesk(JsonStore):
             raise ValueError("ticket must exist and be open")
         if "opened_at" not in ticket:
             raise ValueError("ticket has no opened_at")
-        if ticket.get("first_response") is not None:
+        if _first_response_of(ticket) is not None:
             raise ValueError("ticket already has a first response")
         if responded_at < ticket["opened_at"]:
             raise ValueError("responded_at must not be earlier than opened_at")
@@ -419,7 +427,7 @@ class SupportDesk(JsonStore):
             raise ValueError("ticket must exist and be open")
         if "opened_at" not in ticket:
             raise ValueError("ticket has no opened_at")
-        if ticket.get("first_response") is not None:
+        if _first_response_of(ticket) is not None:
             raise ValueError("ticket already has a first response")
         snapshot, chosen_revision = self._knowledge_snapshot(data, article_id, revision)
         if responded_at < ticket["opened_at"]:
@@ -441,7 +449,7 @@ class SupportDesk(JsonStore):
             raise ValueError("ticket must exist and be open")
         if "opened_at" not in ticket:
             raise ValueError("ticket has no opened_at")
-        if ticket.get("first_response") is None:
+        if _first_response_of(ticket) is None:
             raise ValueError("ticket has no first response")
         return ticket
 
@@ -502,7 +510,7 @@ class SupportDesk(JsonStore):
     def response_stats(self):
         tickets = list(self._read().get("tickets", {}).values())
         timed = [t for t in tickets if "opened_at" in t]
-        responded = [t for t in timed if t.get("first_response") is not None]
+        responded = [t for t in timed if _first_response_of(t) is not None]
         durations = [t["first_response"]["responded_at"] - t["opened_at"] for t in responded]
         return {
             "timed": len(timed),
@@ -541,7 +549,7 @@ class SupportDesk(JsonStore):
         items = []
         untimed = 0
         for ticket in self._read().get("tickets", {}).values():
-            if ticket["status"] == "closed" or ticket.get("first_response") is not None:
+            if ticket["status"] == "closed" or _first_response_of(ticket) is not None:
                 continue
             if "opened_at" not in ticket:
                 untimed += 1
@@ -707,7 +715,7 @@ class SupportDesk(JsonStore):
                 continue
             if ticket["opened_at"] > as_of:
                 raise ValueError("opened_at must not be later than as_of")
-            response = ticket.get("first_response")
+            response = _first_response_of(ticket)
             if response is not None and response["responded_at"] > as_of:
                 raise ValueError("responded_at must not be later than as_of")
         groups = []
@@ -721,7 +729,7 @@ class SupportDesk(JsonStore):
                 if "opened_at" not in ticket:
                     counts["untimed"] += 1
                     continue
-                response = ticket.get("first_response")
+                response = _first_response_of(ticket)
                 if response is not None:
                     counts["responded"] += 1
                     if response["responded_at"] - ticket["opened_at"] <= target:
