@@ -704,7 +704,7 @@ class SupportDesk(JsonStore):
         }
         return {"as_of": as_of, "summary": summary, "items": items}
 
-    def response_target_report(self, as_of, targets=None):
+    def response_target_report(self, as_of, targets=None, since=None, until=None):
         as_of = minute(as_of, "as_of")
         target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
         if targets is not None:
@@ -714,8 +714,27 @@ class SupportDesk(JsonStore):
                 if priority not in PRIORITY_RANK:
                     raise ValueError("targets has an unknown priority: " + str(priority))
                 target_minutes[priority] = positive(value, "targets." + priority)
+        if since is not None:
+            since = minute(since, "since")
+        if until is not None:
+            until = minute(until, "until")
+        if since is not None and until is not None and until < since:
+            raise ValueError("until must not be earlier than since")
         tickets = list(self._read().get("tickets", {}).values())
-        for ticket in tickets:
+        if since is None and until is None:
+            # No window: every ticket takes part, untimed ones included.
+            selected = tickets
+        else:
+            # The window selects by opened_at only: since is inclusive, until
+            # exclusive and an omitted/null bound means no limit on that side;
+            # equal bounds make the interval empty. Tickets without opened_at
+            # never enter a windowed query, and response, close or reopen times
+            # play no part in the selection.
+            selected = [ticket for ticket in tickets
+                        if "opened_at" in ticket
+                        and (since is None or ticket["opened_at"] >= since)
+                        and (until is None or ticket["opened_at"] < until)]
+        for ticket in selected:
             if "opened_at" not in ticket:
                 continue
             if ticket["opened_at"] > as_of:
@@ -729,7 +748,7 @@ class SupportDesk(JsonStore):
             target = target_minutes[priority]
             counts = {"responded": 0, "on_time": 0, "late": 0, "pending": 0,
                       "overdue": 0, "untimed": 0, "closed_without_response": 0}
-            for ticket in tickets:
+            for ticket in selected:
                 if ticket.get("priority", "normal") != priority:
                     continue
                 if "opened_at" not in ticket:
