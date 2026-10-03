@@ -783,6 +783,61 @@ class SupportDesk(JsonStore):
         matched.sort(key=lambda item: item["ticket"]["ticket_id"])
         return {"total": len(matched), "items": matched[offset:offset + limit]}
 
+    def correct_knowledge(self, article_id, ticket_ids, replied_at):
+        article_id = text(article_id, "article_id")
+        if not isinstance(ticket_ids, list) or not ticket_ids:
+            raise ValueError("ticket_ids must be a nonempty array")
+        ids = []
+        for element in ticket_ids:
+            if not isinstance(element, str) or not element.strip():
+                raise ValueError("ticket_ids elements must be nonblank strings")
+            ids.append(element.strip())
+        if len(set(ids)) != len(ids):
+            raise ValueError("ticket_ids must not contain duplicate ids")
+        replied_at = minute(replied_at, "replied_at")
+        data = self._read()
+        snapshot, _ = self._knowledge_snapshot(data, article_id, None)
+        entry = data["knowledge"][article_id]
+        tickets = data.get("tickets", {})
+        reviews = data.get("knowledge_reviews", {})
+        current = {"title": entry["title"], "content": entry["content"]}
+        targets = []
+        for ticket_id in ids:
+            ticket = tickets.get(ticket_id)
+            if ticket is None or ticket["status"] != "open":
+                raise ValueError("ticket must exist and be open")
+            if "opened_at" not in ticket:
+                raise ValueError("ticket has no opened_at")
+            response = ticket.get("first_response")
+            # Missing, null or an empty object means there is no first response.
+            if not isinstance(response, dict) or not response:
+                raise ValueError("ticket has no first response")
+            references = self._stale_references(ticket, entry, article_id)
+            confirmations = reviews.get(ticket_id, {}).get(article_id, {})
+            pending = [reference for reference in references
+                       if confirmations.get(self._review_key(reference)) != current]
+            if not pending:
+                raise ValueError("ticket has no unconfirmed stale reference to the article")
+            self._check_reply_time(ticket, replied_at)
+            targets.append((ticket, ticket_id, references))
+        corrected = []
+        for ticket, ticket_id, references in targets:
+            ticket.setdefault("replies", []).append({
+                "message": snapshot["content"],
+                "replied_at": replied_at,
+                "knowledge": dict(snapshot),
+            })
+            # Confirm every stale reference present at submission against the
+            # current title/content, exactly like review_knowledge does.
+            confirmations = (data.setdefault("knowledge_reviews", {})
+                             .setdefault(ticket_id, {}).setdefault(article_id, {}))
+            for reference in references:
+                confirmations[self._review_key(reference)] = {"title": entry["title"],
+                                                              "content": entry["content"]}
+            corrected.append(ticket)
+        self._write(data)
+        return corrected
+
     def auto_assign(self, assignees, max_open=5):
         if not isinstance(assignees, list) or not assignees:
             raise ValueError("assignees must be a nonempty array")
