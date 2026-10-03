@@ -996,6 +996,54 @@ class SupportDesk(JsonStore):
                      if ticket["ticket_id"] not in assigned_ids]
         return {"assigned": assigned, "remaining": remaining}
 
+    def auto_categorize(self, rules):
+        if not isinstance(rules, list) or not rules:
+            raise ValueError("rules must be a nonempty array")
+        normalized = []
+        for rule in rules:
+            if not isinstance(rule, dict) or set(rule) != {"category", "query"}:
+                raise ValueError("each rule must be an object with only category and query")
+            category = rule["category"]
+            if not isinstance(category, str) or not category.strip():
+                raise ValueError("rule category must be a nonblank string")
+            query = rule["query"]
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("rule query must be a nonblank string")
+            # Queries split on whitespace and fold case; punctuation stays part of
+            # the token and matches literally. Several rules may share a category.
+            normalized.append((category.strip(),
+                               [term.casefold() for term in query.strip().split()]))
+        data = self._read()
+        candidates = [ticket for ticket in data.get("tickets", {}).values()
+                      if ticket["status"] == "open" and ticket.get("category") is None]
+        classified = []
+        remaining = []
+        for ticket in candidates:
+            # Only the subject and customer follow-up bodies are searched; customer
+            # name, notes, resolution, agent replies and knowledge stay out. A ticket
+            # without a follow-up history simply matches the subject alone.
+            haystacks = [ticket["subject"].casefold()]
+            haystacks.extend(message["message"].casefold()
+                             for message in ticket.get("customer_messages") or [])
+            chosen = None
+            # Rule order decides priority; the first matching rule wins.
+            for category, terms in normalized:
+                # Each term must be a contiguous substring of one record; different
+                # terms may hit different records, but a term never spans records.
+                if all(any(term in haystack for haystack in haystacks) for term in terms):
+                    chosen = category
+                    break
+            if chosen is None:
+                remaining.append(ticket["ticket_id"])
+            else:
+                ticket["category"] = chosen
+                classified.append(ticket)
+        classified.sort(key=lambda ticket: ticket["ticket_id"])
+        remaining.sort()
+        if classified:
+            self._write(data)
+        return {"classified": classified, "remaining": remaining}
+
     def conversation(self, ticket_id, offset=0, limit=20):
         ticket_id = text(ticket_id, "ticket_id")
         # bool is a subclass of int, so compare types explicitly; floats and strings are rejected too.

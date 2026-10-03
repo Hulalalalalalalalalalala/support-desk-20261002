@@ -3707,5 +3707,212 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual(SupportDesk(self.root).get("T-3")["priority"], "urgent")
 
+    def test_auto_categorize_matches_subject_and_customer_messages(self):
+        self.app.open_ticket("T-1", "Alice", "Login fails on startup")
+        self.app.open_ticket("T-2", "Bob", "Cannot print", opened_at=0)
+        self.app.receive("T-2", "the printer is offline", 1)
+        self.app.open_ticket("T-3", "Cara", "network drop", opened_at=0)
+        self.app.receive("T-3", "slow speeds", 1)
+        rules = [{"category": "Auth", "query": " login STARTUP "},
+                 {"category": "Hardware", "query": "print offline"},
+                 {"category": "Hardware", "query": "network speeds"}]
+        result = self.app.auto_categorize(rules)
+        self.assertEqual([(t["ticket_id"], t["category"]) for t in result["classified"]],
+                         [("T-1", "Auth"), ("T-2", "Hardware"), ("T-3", "Hardware")])
+        self.assertEqual(result["remaining"], [])
+        self.assertEqual(result["classified"][0], self.app.get("T-1"))
+
+    def test_auto_categorize_casefold_punctuation_literal_and_no_cross_record_term(self):
+        self.app.open_ticket("T-case", "A", "STRASSE café", opened_at=0)
+        self.app.receive("T-case", "HOTLINE", 1)
+        # casefold matches: "strasse" matches "STRASSE" and "hotline" matches the follow-up
+        result = self.app.auto_categorize([{"category": "c", "query": "strasse HOTLINE"}])
+        self.assertEqual([t["ticket_id"] for t in result["classified"]], ["T-case"])
+        # punctuation is part of the token and matches literally
+        self.app.open_ticket("T-punct", "A", "error 500!")
+        self.assertEqual(self.app.auto_categorize([{"category": "c", "query": "500!"}])["classified"][0]["ticket_id"],
+                         "T-punct")
+        # classified tickets leave the pool; reset it to check the literal "?" mismatch
+        self.app.set_category("T-punct", None)
+        self.assertEqual(self.app.auto_categorize([{"category": "c", "query": "500?"}])["remaining"], ["T-punct"])
+        # remove it from the candidate pool for the cross-record checks below
+        self.app.set_category("T-punct", "other")
+        # different terms may hit different records, but a single term cannot be
+        # assembled from pieces across records
+        self.app.open_ticket("T-split", "A", "net", opened_at=0)
+        self.app.receive("T-split", "work", 1)
+        result = self.app.auto_categorize([{"category": "c", "query": "network"}])
+        self.assertEqual(result, {"classified": [], "remaining": ["T-split"]})
+        # two separate terms may hit the subject and the follow-up respectively
+        self.app.open_ticket("T-join", "A", "network", opened_at=0)
+        self.app.receive("T-join", "slow", 1)
+        result = self.app.auto_categorize([{"category": "c", "query": "network slow"}])
+        self.assertEqual([t["ticket_id"] for t in result["classified"]], ["T-join"])
+        # T-split remains uncategorized; punctuation inside a token still matches literally
+        self.assertEqual(result["remaining"], ["T-split"])
+
+    def test_auto_categorize_ignores_customer_notes_replies_resolution_knowledge(self):
+        self.app.open_ticket("T-open", "billingcorp", "plain subject", opened_at=0)
+        self.app.note("T-open", "billing keyword in note")
+        self.app.respond("T-open", "billing keyword in first response", 1)
+        self.app.reply("T-open", "billing keyword in later reply", 2)
+        rules = [{"category": "Billing", "query": "billing"}]
+        result = self.app.auto_categorize(rules)
+        self.assertEqual(result, {"classified": [], "remaining": ["T-open"]})
+        self.assertNotIn("category", self.app.get("T-open"))
+        # knowledge content does not match either
+        self.app.open_ticket("SRC", "A", "source")
+        self.app.assign("SRC", "Eve")
+        self.app.close("SRC", "billing knowledge body")
+        self.app.publish_knowledge("KB", "SRC")
+        self.app.open_ticket("T-know", "B", "another plain subject", opened_at=0)
+        self.app.respond_with_knowledge("T-know", "KB", responded_at=1)
+        result = self.app.auto_categorize(rules)
+        self.assertEqual(result, {"classified": [], "remaining": ["T-know", "T-open"]})
+        # a closed ticket whose resolution contains the keyword is not a candidate
+        self.assertEqual(SupportDesk(self.root).get("SRC")["status"], "closed")
+
+    def test_auto_categorize_only_open_uncategorized_tickets_are_candidates(self):
+        self.app.open_ticket("T-closed", "A", "billing problem")
+        self.app.assign("T-closed", "Eve")
+        self.app.close("T-closed", "done")
+        self.app.open_ticket("T-done", "B", "billing problem")
+        self.app.set_category("T-done", "Other")
+        self.app.open_ticket("T-null", "C", "billing problem")
+        self.app.set_category("T-null", None)
+        result = self.app.auto_categorize([{"category": "Billing", "query": "billing"}])
+        self.assertEqual([(t["ticket_id"], t["category"]) for t in result["classified"]],
+                         [("T-null", "Billing")])
+        self.assertEqual(result["remaining"], [])
+        # closed and already categorized tickets are untouched
+        self.assertEqual(self.app.get("T-closed")["status"], "closed")
+        self.assertNotIn("category", self.app.get("T-closed"))
+        self.assertEqual(self.app.get("T-done")["category"], "Other")
+
+    def test_auto_categorize_first_rule_wins_and_keeps_category_spacing_case(self):
+        self.app.open_ticket("T-1", "A", "billing login problem")
+        self.app.open_ticket("T-2", "B", "plain billing")
+        rules = [{"category": "Auth", "query": "login"},
+                 {"category": "Billing", "query": "billing"},
+                 {"category": "Billing", "query": "plain"}]
+        result = self.app.auto_categorize(rules)
+        self.assertEqual([t["category"] for t in result["classified"]], ["Auth", "Billing"])
+        # outer whitespace is trimmed, inner whitespace and letter case are preserved
+        self.app.open_ticket("T-3", "C", "printer jam")
+        result = self.app.auto_categorize([{"category": "  Net  Work  ", "query": "printer"}])
+        self.assertEqual(result["classified"][0]["category"], "Net  Work")
+        self.assertEqual(self.app.auto_categorize([{"category": "net  work", "query": "nothing"}])["classified"], [])
+        self.assertEqual(self.app.get("T-3")["category"], "Net  Work")
+
+    def test_auto_categorize_sorts_both_arrays_case_sensitively(self):
+        for ticket_id, subject in [("t-b", "billing"), ("T-A", "billing"),
+                                   ("T-1", "billing"), ("t-a", "other")]:
+            self.app.open_ticket(ticket_id, "A", subject)
+        result = self.app.auto_categorize([{"category": "Billing", "query": "billing"}])
+        self.assertEqual([t["ticket_id"] for t in result["classified"]], ["T-1", "T-A", "t-b"])
+        self.assertEqual(result["remaining"], ["t-a"])
+
+    def test_auto_categorize_persists_and_feeds_route_assign_after_recreation(self):
+        self.app.open_ticket("T-1", "A", "billing issue")
+        self.app.open_ticket("T-2", "B", "network outage")
+        self.app.auto_categorize([{"category": "billing", "query": "billing"},
+                                  {"category": "network", "query": "network"}])
+        reloaded = SupportDesk(self.root)
+        self.assertEqual(reloaded.get("T-1")["category"], "billing")
+        self.assertEqual(reloaded.get("T-2")["category"], "network")
+        self.assertEqual([t["ticket_id"] for t in reloaded.list_by_category("billing")], ["T-1"])
+        routed = reloaded.route_assign([{"category": "billing", "assignees": ["Bob"]},
+                                        {"category": "network", "assignees": ["Nia"]}])
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in routed["assigned"]],
+                         [("T-1", "Bob"), ("T-2", "Nia")])
+
+    def test_auto_categorize_no_match_writes_nothing(self):
+        self.app.open_ticket("T", "A", "plain subject")
+        before = self.app.path.read_bytes()
+        result = self.app.auto_categorize([{"category": "c", "query": "missing"}])
+        self.assertEqual(result, {"classified": [], "remaining": ["T"]})
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertNotIn("category", self.app.get("T"))
+
+    def test_auto_categorize_missing_root_returns_empty_without_creating(self):
+        missing = self.root / "missing"
+        result = SupportDesk(missing).auto_categorize([{"category": "c", "query": "kw"}])
+        self.assertEqual(result, {"classified": [], "remaining": []})
+        self.assertFalse(missing.exists())
+
+    def test_auto_categorize_old_ticket_without_messages_matches_subject_only(self):
+        app = SupportDesk(self.root)
+        # hand-write an old ticket without opened_at and customer_messages
+        data = {"tickets": {"L-1": {"ticket_id": "L-1", "customer": "A", "subject": "legacy billing",
+                                    "status": "open", "assignee": None, "notes": [],
+                                    "resolution": None}}}
+        app._write(data)
+        result = SupportDesk(self.root).auto_categorize([{"category": "Billing", "query": "billing"}])
+        self.assertEqual([t["ticket_id"] for t in result["classified"]], ["L-1"])
+        raw = json.loads(app.path.read_text(encoding="utf-8"))
+        self.assertNotIn("customer_messages", raw["tickets"]["L-1"])
+
+    def test_auto_categorize_rejects_bad_rules_without_writing_even_without_candidates(self):
+        self.app.open_ticket("T", "A", "billing")
+        before = self.app.path.read_bytes()
+        bad_rules = [
+            None, [], "x", {}, 1,
+            [{}],
+            [{"query": "q"}],
+            [{"category": "c"}],
+            [{"category": "c", "query": "q", "extra": 1}],
+            [{"category": 1, "query": "q"}],
+            [{"category": None, "query": "q"}],
+            [{"category": True, "query": "q"}],
+            [{"category": "  ", "query": "q"}],
+            [{"category": "c", "query": None}],
+            [{"category": "c", "query": 1}],
+            [{"category": "c", "query": "  "}],
+            [None], ["x"], [["c", "q"]],
+        ]
+        for bad in bad_rules:
+            with self.assertRaises(ValueError, msg=bad):
+                self.app.auto_categorize(bad)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # validation still runs with no data and must not create the missing directory
+        missing = self.root / "missing"
+        for bad in ([], [{"category": "c", "query": "x", "extra": 1}]):
+            with self.assertRaises(ValueError, msg=bad):
+                SupportDesk(missing).auto_categorize(bad)
+        self.assertFalse(missing.exists())
+        with self.assertRaises(TypeError):
+            self.app.auto_categorize()
+        with self.assertRaises(TypeError):
+            self.app.auto_categorize([{"category": "c", "query": "q"}], bogus=1)
+
+    def test_cli_auto_categorize_object_array_and_failure(self):
+        self.app.open_ticket("T-1", "A", "billing issue")
+        self.app.open_ticket("T-2", "B", "network outage")
+        payload = self.root / "rules.json"
+        payload.write_text(json.dumps({"rules": [{"category": "billing", "query": "billing"},
+                                                 {"category": "network", "query": "network"}]}),
+                           encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "category-auto", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([t["ticket_id"] for t in value["classified"]], ["T-1", "T-2"])
+        self.assertEqual(value["remaining"], [])
+        # array input: each row is an independent call; a failing row exits 2
+        self.app.open_ticket("T-3", "A", "printer issue")
+        payload.write_text(json.dumps([
+            {"rules": [{"category": "hardware", "query": "printer"}]},
+            {"rules": []},
+        ]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "category-auto", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        # the first row committed before the second row failed
+        self.assertEqual(SupportDesk(self.root).get("T-3")["category"], "hardware")
+
 if __name__ == "__main__":
     unittest.main()
