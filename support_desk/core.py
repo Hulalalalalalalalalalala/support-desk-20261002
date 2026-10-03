@@ -186,6 +186,23 @@ def _service_minutes(periods, start, end):
     return total
 
 
+def _due_minute(periods, opened_at, target):
+    # Earliest simulated minute m at which the covered minutes from opened_at
+    # through m-1 first reach target; periods are merged half-open intervals,
+    # so the end of a period is a valid answer. None means the given periods can
+    # never accumulate the target, and an empty period list never reaches it.
+    accumulated = 0
+    for left, right in periods:
+        if right <= opened_at:
+            continue
+        start = left if left > opened_at else opened_at
+        covered = right - start
+        if accumulated + covered >= target:
+            return start + target - accumulated
+        accumulated += covered
+    return None
+
+
 class SupportDesk(JsonStore):
     def open_ticket(self, ticket_id, customer, subject, opened_at=None):
         ticket_id, customer, subject = text(ticket_id, "ticket_id"), text(customer, "customer"), text(subject, "subject")
@@ -937,6 +954,60 @@ class SupportDesk(JsonStore):
             rate = counts["on_time"] / counts["responded"] if counts["responded"] else None
             groups.append({"priority": priority, "target_minutes": target, **counts, "on_time_rate": rate})
         return {"as_of": as_of, "groups": groups}
+
+    def response_target_queue(self, as_of, targets=None, service_periods=None):
+        # Parameters are validated even when the store holds no data.
+        as_of = minute(as_of, "as_of")
+        target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
+        if targets is not None:
+            if not isinstance(targets, dict):
+                raise ValueError("targets must be an object or null")
+            for priority, value in targets.items():
+                if priority not in PRIORITY_RANK:
+                    raise ValueError("targets has an unknown priority: " + str(priority))
+                target_minutes[priority] = positive(value, "targets." + priority)
+        periods = _service_periods(service_periods)
+        items = []
+        untimed = 0
+        for ticket in self._read().get("tickets", {}).values():
+            # Only open tickets are candidates; responded and closed tickets are
+            # excluded, and their future times are never checked. Assignment is
+            # irrelevant to membership.
+            if ticket["status"] != "open":
+                continue
+            response = ticket.get("first_response")
+            # Missing, null or an empty object means the ticket still awaits
+            # its first response; only a non-empty object removes it.
+            if isinstance(response, dict) and response:
+                continue
+            if "opened_at" not in ticket:
+                # No registration time: counted as untimed and never queued.
+                untimed += 1
+                continue
+            if ticket["opened_at"] > as_of:
+                raise ValueError("opened_at must not be later than as_of")
+            target = target_minutes[ticket.get("priority", "normal")]
+            if periods is None:
+                waiting = as_of - ticket["opened_at"]
+                due_at = ticket["opened_at"] + target
+            else:
+                # Only minutes covered by a service period count; merged periods
+                # make overlapping, repeated and touching intervals count once.
+                waiting = _service_minutes(periods, ticket["opened_at"], as_of)
+                # The due simulation may run beyond as_of using the periods given;
+                # coverage that can never reach the target leaves due_at null.
+                due_at = _due_minute(periods, ticket["opened_at"], target)
+            items.append({"ticket": ticket, "waiting_minutes": waiting,
+                          "due_at": due_at, "overdue": waiting > target})
+        # Overdue tickets first, then urgent/high/normal/low (missing priority is
+        # normal), then ascending due time with nulls last, finally the
+        # case-sensitive ticket id.
+        items.sort(key=lambda item: (not item["overdue"],
+                                     PRIORITY_RANK[item["ticket"].get("priority", "normal")],
+                                     item["due_at"] is None,
+                                     item["due_at"] if item["due_at"] is not None else 0,
+                                     item["ticket"]["ticket_id"]))
+        return {"untimed": untimed, "items": items}
 
     def assignee_workload_report(self, as_of, response_minutes=30, follow_up_minutes=60):
         as_of = minute(as_of, "as_of")

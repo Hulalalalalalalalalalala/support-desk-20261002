@@ -949,6 +949,233 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual(failed.stdout, "")
 
+    def test_response_target_queue_natural_minutes_due_waiting_and_boundary(self):
+        self.app.open_ticket("T-5", "Alice", "A", opened_at=25)
+        queue30 = self.app.response_target_queue(30)
+        self.assertEqual(set(queue30), {"untimed", "items"})
+        only = queue30["items"][0]
+        self.assertEqual(set(only), {"ticket", "waiting_minutes", "due_at", "overdue"})
+        # natural minutes: due at opened_at + normal target (30), waiting equals the target is not overdue
+        self.assertEqual((only["waiting_minutes"], only["due_at"], only["overdue"]), (5, 55, False))
+        self.assertEqual(only["ticket"], self.app.get("T-5"))
+
+    def test_response_target_queue_service_periods_match_worked_example(self):
+        periods = [[10, 20], [30, 50]]
+        self.app.open_ticket("T-wait", "Alice", "A", opened_at=15)
+        queue40 = self.app.response_target_queue(40, {"normal": 15}, service_periods=periods)
+        only = queue40["items"][0]
+        # 15..19 (5) + 30..39 (10) = 15 covered minutes; the target is first reached at 40
+        self.assertEqual((only["waiting_minutes"], only["due_at"], only["overdue"]), (15, 40, False))
+        # the next covered minute makes the wait strictly exceed the target
+        queue41 = self.app.response_target_queue(41, {"normal": 15}, service_periods=periods)
+        self.assertEqual((queue41["items"][0]["waiting_minutes"], queue41["items"][0]["overdue"]),
+                         (16, True))
+        # due_at is still simulated from periods after as_of: querying at 20 keeps due 40
+        queue20 = self.app.response_target_queue(20, {"normal": 15}, service_periods=periods)
+        self.assertEqual((queue20["items"][0]["waiting_minutes"], queue20["items"][0]["due_at"]),
+                         (5, 40))
+
+    def test_response_target_queue_candidates_untimed_and_exclusions(self):
+        self.app.open_ticket("T-open", "Alice", "A", opened_at=5)
+        self.app.open_ticket("T-null", "Bob", "B", opened_at=5)  # first_response stays null
+        self.app.open_ticket("T-empty", "Cara", "C", opened_at=5)
+        data = self.app._read()
+        data["tickets"]["T-empty"]["first_response"] = {}
+        self.app._write(data)
+        self.app.open_ticket("T-untimed", "Dan", "D")  # no opened_at
+        self.app.open_ticket("T-responded", "Eve", "E", opened_at=5)
+        self.app.respond("T-responded", "Seen", 6)
+        self.app.open_ticket("T-closed-unanswered", "Fay", "F", opened_at=5)
+        self.app.assign("T-closed-unanswered", "Gus")
+        self.app.close("T-closed-unanswered", "Done")
+        self.app.open_ticket("T-closed-responded", "Han", "G", opened_at=5)
+        self.app.assign("T-closed-responded", "Ivy")
+        self.app.respond("T-closed-responded", "Seen", 6)
+        self.app.close("T-closed-responded", "Done")
+        # unassigned open pending tickets stay candidates; assignment is irrelevant
+        queue = self.app.response_target_queue(100)
+        self.assertEqual(queue["untimed"], 1)
+        self.assertEqual([item["ticket"]["ticket_id"] for item in queue["items"]],
+                         ["T-empty", "T-null", "T-open"])
+
+    def test_response_target_queue_sorts_overdue_priority_due_and_id(self):
+        def open_pending(ticket_id, priority, opened_at):
+            self.app.open_ticket(ticket_id, "Alice", "A", opened_at=opened_at)
+            self.app.set_priority(ticket_id, priority)
+        open_pending("a", "urgent", 90)   # due 95, waiting 10, overdue
+        open_pending("b", "urgent", 95)   # due 100, waiting 5, not overdue
+        open_pending("c", "high", 95)     # due 110, not overdue
+        open_pending("d", "normal", 50)   # due 80, waiting 50, overdue
+        open_pending("e", "low", 0)       # due 60, waiting 100, overdue
+        open_pending("f", "normal", 99)   # due 129, not overdue
+        queue = self.app.response_target_queue(100)
+        # overdue first (priority urgent, normal, low), then the rest by priority and due asc
+        self.assertEqual([item["ticket"]["ticket_id"] for item in queue["items"]],
+                         ["a", "d", "e", "b", "c", "f"])
+
+    def test_response_target_queue_null_due_sorts_last_then_case_sensitive_id(self):
+        periods = [[0, 10], [20, 40]]
+        # both normal, neither overdue at as_of 30: A reaches the target at 40,
+        # B (opened 30) only ever sees 10 covered minutes and never becomes due
+        self.app.open_ticket("A-finite", "Alice", "A", opened_at=0)
+        self.app.open_ticket("B-null", "Bob", "B", opened_at=30)
+        queue = self.app.response_target_queue(30, service_periods=periods)
+        values = [(item["ticket"]["ticket_id"], item["due_at"], item["overdue"])
+                  for item in queue["items"]]
+        self.assertEqual(values, [("A-finite", 40, False), ("B-null", None, False)])
+        # equal dues break ties by the case-sensitive ticket id: uppercase first
+        self.app.open_ticket("t-a", "Cara", "C", opened_at=50)
+        self.app.open_ticket("T-b", "Dan", "D", opened_at=50)
+        natural = self.app.response_target_queue(100)
+        tied = [item["ticket"]["ticket_id"] for item in natural["items"]
+                if item["ticket"]["ticket_id"] in ("t-a", "T-b")]
+        self.assertEqual(tied, ["T-b", "t-a"])
+
+    def test_response_target_queue_empty_periods_zero_wait_null_due_never_overdue(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        queue = self.app.response_target_queue(100, service_periods=[])
+        self.assertEqual(queue["untimed"], 0)
+        self.assertEqual([(item["waiting_minutes"], item["due_at"], item["overdue"])
+                          for item in queue["items"]],
+                         [(0, None, False)])
+
+    def test_response_target_queue_insufficient_periods_leave_due_null(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        queue = self.app.response_target_queue(100, {"normal": 31}, service_periods=[[0, 10], [20, 40]])
+        # only 30 covered minutes exist; wait stays below the target and due_at is null
+        self.assertEqual([(item["waiting_minutes"], item["due_at"], item["overdue"])
+                          for item in queue["items"]],
+                         [(30, None, False)])
+
+    def test_response_target_queue_merges_overlapping_repeated_touching_periods(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        variants = [
+            [[0, 6], [5, 10]],
+            [[5, 10], [0, 5]],          # touching: [0,5) + [5,10)
+            [[0, 10], [0, 6], [2, 4]],  # duplicates and containment
+        ]
+        for periods in variants:
+            queue = self.app.response_target_queue(10, {"normal": 10}, service_periods=periods)
+            self.assertEqual((queue["items"][0]["waiting_minutes"], queue["items"][0]["due_at"],
+                              queue["items"][0]["overdue"]), (10, 10, False), periods)
+
+    def test_response_target_queue_target_override_changes_due(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        self.assertEqual(self.app.response_target_queue(0)["items"][0]["due_at"], 30)
+        self.assertEqual(self.app.response_target_queue(0, {"normal": 31})["items"][0]["due_at"], 31)
+        # omitted, null and empty targets share the defaults
+        self.assertEqual(self.app.response_target_queue(0, None)["items"][0]["due_at"], 30)
+        self.assertEqual(self.app.response_target_queue(0, {})["items"][0]["due_at"], 30)
+
+    def test_response_target_queue_rejects_future_candidate_even_with_empty_periods(self):
+        self.app.open_ticket("T-future", "Alice", "A", opened_at=101)
+        before = self.app.path.read_bytes()
+        for periods in (None, [], [[0, 200]]):
+            with self.assertRaises(ValueError, msg=periods):
+                self.app.response_target_queue(100, service_periods=periods)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_response_target_queue_excluded_tickets_skip_future_time_checks(self):
+        # a closed and a responded ticket with future opened_at do not invalidate the query
+        self.app.open_ticket("T-closed", "Bob", "B", opened_at=101)
+        self.app.assign("T-closed", "Eve")
+        self.app.close("T-closed", "Done")
+        self.app.open_ticket("T-responded", "Cara", "C", opened_at=101)
+        self.app.respond("T-responded", "Seen", 102)
+        queue = self.app.response_target_queue(100, service_periods=[])
+        self.assertEqual(queue, {"untimed": 0, "items": []})
+
+    def test_response_target_queue_rejects_bad_arguments_without_writing(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        before = self.app.path.read_bytes()
+        for as_of in (-1, True, 1.5, "100", None):
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.response_target_queue(as_of)
+        bad_targets = [
+            [], "x", 5, True,
+            {"critical": 10},
+            {"normal": 0}, {"normal": -1},
+            {"normal": True}, {"normal": 30.0}, {"normal": "30"}, {"normal": None},
+        ]
+        for targets in bad_targets:
+            with self.assertRaises(ValueError, msg=targets):
+                self.app.response_target_queue(100, targets)
+        bad_periods = [
+            {}, "x", 5, True, False,
+            [[0, 10], "x"], [[0]], [[0, 10, 20]],
+            [[True, 10]], [[0, False]], [[0.0, 10]], [[0, 10.0]],
+            [[None, 10]], [[0, "10"]],
+            [[-1, 10]], [[10, 10]], [[20, 10]],
+        ]
+        for periods in bad_periods:
+            with self.assertRaises(ValueError, msg=periods):
+                self.app.response_target_queue(100, service_periods=periods)
+        with self.assertRaises(TypeError):
+            self.app.response_target_queue()
+        with self.assertRaises(TypeError):
+            self.app.response_target_queue(100, {}, extra=1)
+        # parameters are validated with no data too
+        with self.assertRaises(ValueError):
+            SupportDesk(self.root / "empty").response_target_queue(-1, service_periods=[[-1, 5]])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_response_target_queue_empty_data_and_missing_directory_create_nothing(self):
+        self.assertEqual(self.app.response_target_queue(0), {"untimed": 0, "items": []})
+        self.assertFalse(self.app.path.exists())
+        missing = self.root / "missing"
+        self.assertEqual(SupportDesk(missing).response_target_queue(0, {}),
+                         {"untimed": 0, "items": []})
+        self.assertFalse(missing.exists())
+
+    def test_response_target_queue_is_read_only_and_does_not_backfill(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        before = self.app.path.read_bytes()
+        self.app.response_target_queue(100, service_periods=[[0, 200]])
+        self.app.response_target_queue(0)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertNotIn("priority", self.app.get("T"))
+
+    def test_cli_response_target_queue(self):
+        periods = [[10, 20], [30, 50]]
+        self.app.open_ticket("T-wait", "Alice", "A", opened_at=15)
+        payload = self.root / "queue.json"
+        payload.write_text(json.dumps({"as_of": 41, "targets": {"normal": 15},
+                                       "service_periods": periods}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "response-target-queue", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(set(value), {"untimed", "items"})
+        self.assertEqual([(i["ticket"]["ticket_id"], i["waiting_minutes"], i["due_at"], i["overdue"])
+                          for i in value["items"]], [("T-wait", 16, 40, True)])
+        # an array runs each object independently and returns an array of queues
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"as_of": 40, "targets": {"normal": 15}, "service_periods": periods},
+            {"as_of": 41, "targets": {"normal": 15}, "service_periods": periods},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "response-target-queue", str(batch)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        queues = json.loads(result.stdout)
+        self.assertEqual([q["items"][0]["overdue"] for q in queues], [False, True])
+        # bad arguments fail through the shared envelope and stop the batch
+        bad = self.root / "bad.json"
+        for body in ({"as_of": -1}, {"as_of": 100, "service_periods": [[20, 10]]},
+                     {}, {"as_of": 100, "extra": 1}):
+            bad.write_text(json.dumps(body), encoding="utf-8")
+            failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "response-target-queue", str(bad)], text=True, capture_output=True)
+            self.assertEqual(failed.returncode, 2, body)
+            self.assertIn("error", json.loads(failed.stderr))
+            self.assertEqual(failed.stdout, "")
+
+    def test_cli_response_target_queue_missing_directory_creates_nothing(self):
+        missing = self.root / "missing"
+        payload = self.root / "queue.json"
+        payload.write_text(json.dumps({"as_of": 0}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(missing), "response-target-queue", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"untimed": 0, "items": []})
+        self.assertFalse(missing.exists())
+
     def test_set_knowledge_enabled_persists_and_repeat_is_quiet(self):
         self._closed_ticket()
         entry = self.app.publish_knowledge("KB-1", "T")
