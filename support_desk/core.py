@@ -718,6 +718,70 @@ class SupportDesk(JsonStore):
                  "overdue": waiting > target_minutes}
                 for earliest, ticket, count, waiting in entries]
 
+    def pending_queue(self, as_of, response_minutes=30, customer_minutes=30):
+        as_of = minute(as_of, "as_of")
+        response_minutes = positive(response_minutes, "response_minutes")
+        customer_minutes = positive(customer_minutes, "customer_minutes")
+        entries = []
+        untimed = 0
+        for ticket in self._read().get("tickets", {}).values():
+            if ticket["status"] != "open":
+                # Closed tickets leave the queue and skip every time check.
+                continue
+            response = ticket.get("first_response")
+            # Missing, null or an empty object means the ticket still awaits its first response.
+            has_response = isinstance(response, dict) and bool(response)
+            messages = ticket.get("customer_messages")
+            if not has_response:
+                if "opened_at" not in ticket:
+                    # No registration time: counted as untimed and produces no response wait.
+                    untimed += 1
+                elif ticket["opened_at"] > as_of:
+                    raise ValueError("opened_at must not be later than as_of")
+            if messages:
+                answer_times = ([response["responded_at"]] if has_response else [])
+                answer_times.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
+                # On any ticket with a follow-up history, a follow-up, first response or
+                # later reply later than as_of invalidates the whole query even when every
+                # follow-up is already covered by an answer.
+                if any(message["received_at"] > as_of for message in messages) or \
+                        any(time > as_of for time in answer_times):
+                    raise ValueError("customer message or response time must not be later than as_of")
+            else:
+                answer_times = []
+            response_wait = None
+            if not has_response and "opened_at" in ticket:
+                response_wait = as_of - ticket["opened_at"]
+            customer_wait = None
+            count = 0
+            if messages:
+                # The answer boundary is the latest of the first response and all later
+                # replies; with no answer every follow-up stays unanswered. A follow-up in
+                # the same minute as the boundary is already covered; duplicate follow-ups
+                # are counted separately.
+                boundary = max(answer_times) if answer_times else None
+                unanswered = [message["received_at"] for message in messages
+                              if boundary is None or message["received_at"] > boundary]
+                count = len(unanswered)
+                if unanswered:
+                    customer_wait = as_of - min(unanswered)
+            # A ticket with neither kind of pending wait never enters the queue.
+            if response_wait is None and customer_wait is None:
+                continue
+            overdue = (response_wait is not None and response_wait > response_minutes) or \
+                      (customer_wait is not None and customer_wait > customer_minutes)
+            largest_wait = max(wait for wait in (response_wait, customer_wait) if wait is not None)
+            entries.append((ticket, response_wait, customer_wait, count, overdue, largest_wait))
+        # Overdue tickets first, then urgent/high/normal/low (missing priority is normal),
+        # then the larger non-null wait descending, finally the case-sensitive ticket id.
+        entries.sort(key=lambda entry: (not entry[4],
+                                        PRIORITY_RANK[entry[0].get("priority", "normal")],
+                                        -entry[5], entry[0]["ticket_id"]))
+        return {"untimed": untimed,
+                "items": [{"ticket": ticket, "response_wait": response_wait,
+                           "customer_wait": customer_wait, "count": count, "overdue": overdue}
+                          for ticket, response_wait, customer_wait, count, overdue, _ in entries]}
+
     def customer_response_report(self, as_of, since=0, until=None):
         # Parameters are validated even when the store holds no data.
         as_of = minute(as_of, "as_of")
