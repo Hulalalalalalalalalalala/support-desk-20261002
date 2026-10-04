@@ -1,3 +1,5 @@
+import heapq
+
 from .storage import JsonStore, text, minute, positive
 
 PRIORITIES = ("urgent", "high", "normal", "low")
@@ -142,6 +144,167 @@ def _route_coverage(candidates, rule_by_category, loads, limits):
                 assigned_count += 1
                 break
             remaining_caps[name] += 1
+    return choices
+
+
+def _normalize_rules(rules):
+    # The rule shape shared by route-assign, route-handover and rebalance: a
+    # nonempty array of objects with only category and assignees, where the
+    # category is null or a stripped nonblank string with no duplicates and
+    # every rule's assignees are stripped nonblank, case-sensitive names with
+    # no repeats inside that rule.
+    if not isinstance(rules, list) or not rules:
+        raise ValueError("rules must be a nonempty array")
+    normalized = []
+    categories = set()
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) != {"category", "assignees"}:
+            raise ValueError("each rule must be an object with only category and assignees")
+        category = rule["category"]
+        if category is not None:
+            if not isinstance(category, str) or not category.strip():
+                raise ValueError("rule category must be null or a nonblank string")
+            category = category.strip()
+        if category in categories:
+            raise ValueError("rules must not contain duplicate categories")
+        categories.add(category)
+        raw_assignees = rule["assignees"]
+        if not isinstance(raw_assignees, list) or not raw_assignees:
+            raise ValueError("assignees must be a nonempty array")
+        names = []
+        for element in raw_assignees:
+            if not isinstance(element, str) or not element.strip():
+                raise ValueError("assignees elements must be nonblank strings")
+            names.append(element.strip())
+        if len(set(names)) != len(names):
+            raise ValueError("assignees must not contain duplicate names")
+        normalized.append((category, names))
+    return normalized
+
+
+class _CostEdge:
+    __slots__ = ("to", "rev", "cap", "cost")
+
+    def __init__(self, to, rev, cap, cost):
+        self.to, self.rev, self.cap, self.cost = to, rev, cap, cost
+
+
+def _rebalance_plan(candidates, rule_by_category, names, loads, max_open):
+    # Place every candidate with one of its rule's allowed assignees, keeping
+    # or changing its current ownership. Costs are lexicographic
+    # (max_load, changes, recipient name sequence in candidate order); name
+    # weights make the sequence comparison dominate everything after and stay
+    # strictly smaller than a single change unit.
+    n = len(candidates)
+    if n == 0:
+        return []
+    name_index = {name: pos for pos, name in enumerate(names)}
+    # A single ownership change must outweigh every recipient-sequence
+    # difference combined: sequence weights are K^0..K^(n-1), whose maximum
+    # total is K^n - 1, so one change weighs K^n.
+    change_weight = pow(len(names), n)
+    # Candidate tickets currently held by a participating person already
+    # occupy a slot that may be reused (by keeping or after they leave); only
+    # non-candidate open tickets pin that person's load irreducibly.
+    held = {name: 0 for name in names}
+    for ticket in candidates:
+        current = ticket.get("assignee")
+        if current in held:
+            held[current] += 1
+    fixed = {name: loads[name] - held[name] for name in names}
+
+    def build(cap):
+        source, sink = 0, n + len(names) + 1
+        graph = [[] for _ in range(sink + 1)]
+
+        def add_edge(head, tail, edge_cap, cost):
+            graph[head].append(_CostEdge(tail, len(graph[tail]), edge_cap, cost))
+            graph[tail].append(_CostEdge(head, len(graph[head]) - 1, 0, -cost))
+
+        for i, ticket in enumerate(candidates):
+            ticket_node = 1 + i
+            add_edge(source, ticket_node, 1, 0)
+            allowed = rule_by_category.get(ticket.get("category")) or ()
+            current = ticket.get("assignee")
+            for name in allowed:
+                pos = name_index.get(name)
+                if pos is None:
+                    continue
+                weight = pow(len(names), n - 1 - i)
+                # Names are sorted, so smaller names occupy earlier positions
+                # and cost less; keeping the current assignee skips the
+                # (dominant) change unit.
+                sequence_cost = pos * weight
+                if name != current:
+                    sequence_cost += change_weight
+                add_edge(ticket_node, 1 + n + pos, 1, sequence_cost)
+        for pos, name in enumerate(names):
+            # Final load is fixed (non-candidate) tickets plus arriving units,
+            # so the person can absorb at most cap - fixed units of flow. A
+            # negative slack means no plan can satisfy this cap.
+            add_edge(1 + n + pos, sink, max(0, cap - fixed[name]), 0)
+        return graph, source, sink
+
+    def send(graph, source, sink):
+        # Successive shortest augmenting paths with potentials; reverse edges
+        # reroute earlier tickets when a later one needs their recipient.
+        total_cost = 0
+        potential = [0] * len(graph)
+        for _ in range(n):
+            dist = [None] * len(graph)
+            parents = [None] * len(graph)
+            dist[source] = 0
+            queue = [(0, source)]
+            while queue:
+                current_dist, node = heapq.heappop(queue)
+                if current_dist != dist[node]:
+                    continue
+                for edge_pos, edge in enumerate(graph[node]):
+                    if edge.cap <= 0:
+                        continue
+                    reduced = current_dist + edge.cost + potential[node] - potential[edge.to]
+                    if dist[edge.to] is None or reduced < dist[edge.to]:
+                        dist[edge.to] = reduced
+                        parents[edge.to] = (node, edge_pos)
+                        heapq.heappush(queue, (reduced, edge.to))
+            if dist[sink] is None:
+                return None
+            for node, value in enumerate(dist):
+                if value is not None:
+                    potential[node] += value
+            node = sink
+            while node != source:
+                prev, edge_pos = parents[node]
+                edge = graph[prev][edge_pos]
+                edge.cap -= 1
+                graph[node][edge.rev].cap += 1
+                node = prev
+            total_cost += potential[sink]
+        return total_cost
+
+    # Every candidate ends with one of the participating people, so the
+    # smallest possible peak is at least the ceiling of all final tickets over
+    # the people involved; a person whose fixed (non-candidate) load already
+    # exceeds a cap can never satisfy it because those tickets never move.
+    # Capacities above max_open are infeasible by contract.
+    total_open = sum(fixed.values()) + n
+    lower = max(-(-total_open // len(names)), max(fixed.values()))
+    choices = None
+    for cap in range(max(lower, 0), max_open + 1):
+        graph, source, sink = build(cap)
+        if send(graph, source, sink) is None:
+            continue
+        # Recover the chosen recipient of every ticket from its saturated
+        # ticket->assignee forward edge.
+        chosen = [None] * n
+        for i in range(n):
+            for edge in graph[1 + i]:
+                if edge.to >= 1 + n and edge.cap == 0:
+                    chosen[i] = names[edge.to - 1 - n]
+        choices = chosen
+        break
+    if choices is None:
+        raise ValueError("rules do not cover all selected tickets within capacity")
     return choices
 
 
@@ -1834,32 +1997,7 @@ class SupportDesk(JsonStore):
     def route_assign(self, rules, max_open=5, strategy="greedy", assignee_limits=None):
         if strategy not in ("greedy", "coverage"):
             raise ValueError("strategy must be greedy or coverage")
-        if not isinstance(rules, list) or not rules:
-            raise ValueError("rules must be a nonempty array")
-        normalized = []
-        categories = set()
-        for rule in rules:
-            if not isinstance(rule, dict) or set(rule) != {"category", "assignees"}:
-                raise ValueError("each rule must be an object with only category and assignees")
-            category = rule["category"]
-            if category is not None:
-                if not isinstance(category, str) or not category.strip():
-                    raise ValueError("rule category must be null or a nonblank string")
-                category = category.strip()
-            if category in categories:
-                raise ValueError("rules must not contain duplicate categories")
-            categories.add(category)
-            raw_assignees = rule["assignees"]
-            if not isinstance(raw_assignees, list) or not raw_assignees:
-                raise ValueError("assignees must be a nonempty array")
-            names = []
-            for element in raw_assignees:
-                if not isinstance(element, str) or not element.strip():
-                    raise ValueError("assignees elements must be nonblank strings")
-                names.append(element.strip())
-            if len(set(names)) != len(names):
-                raise ValueError("assignees must not contain duplicate names")
-            normalized.append((category, names))
+        normalized = _normalize_rules(rules)
         max_open = positive(max_open, "max_open")
         known_names = {name for _, names in normalized for name in names}
         # Per-person ceilings for this call only; omitted, null or an empty
@@ -1940,34 +2078,10 @@ class SupportDesk(JsonStore):
     def route_handover(self, source_assignee, rules, reason, transferred_at, max_open=5):
         source_assignee = text(source_assignee, "source_assignee")
         reason = text(reason, "reason")
-        if not isinstance(rules, list) or not rules:
-            raise ValueError("rules must be a nonempty array")
-        normalized = []
-        categories = set()
-        for rule in rules:
-            if not isinstance(rule, dict) or set(rule) != {"category", "assignees"}:
-                raise ValueError("each rule must be an object with only category and assignees")
-            category = rule["category"]
-            if category is not None:
-                if not isinstance(category, str) or not category.strip():
-                    raise ValueError("rule category must be null or a nonblank string")
-                category = category.strip()
-            if category in categories:
-                raise ValueError("rules must not contain duplicate categories")
-            categories.add(category)
-            raw_assignees = rule["assignees"]
-            if not isinstance(raw_assignees, list) or not raw_assignees:
-                raise ValueError("assignees must be a nonempty array")
-            names = []
-            for element in raw_assignees:
-                if not isinstance(element, str) or not element.strip():
-                    raise ValueError("assignees elements must be nonblank strings")
-                names.append(element.strip())
-            if len(set(names)) != len(names):
-                raise ValueError("assignees must not contain duplicate names")
+        normalized = _normalize_rules(rules)
+        for _, names in normalized:
             if source_assignee in names:
                 raise ValueError("assignees must not contain the source assignee")
-            normalized.append((category, names))
         transferred_at = minute(transferred_at, "transferred_at")
         max_open = positive(max_open, "max_open")
         data = self._read()
@@ -2015,6 +2129,67 @@ class SupportDesk(JsonStore):
             handed_over.append(ticket)
         self._write(data)
         return handed_over
+
+    def rebalance_assignments(self, rules, reason, transferred_at, max_open=5):
+        reason = text(reason, "reason")
+        normalized = _normalize_rules(rules)
+        transferred_at = minute(transferred_at, "transferred_at")
+        max_open = positive(max_open, "max_open")
+        data = self._read()
+        tickets = data.get("tickets", {})
+        rule_by_category = {category: names for category, names in normalized}
+        covered_categories = set(rule_by_category)
+        names = sorted({name for _, rule_names in normalized for name in rule_names})
+        loads = {name: 0 for name in names}
+        # Load is the final open-ticket count per person across every category;
+        # existing tickets not taking part in the adjustment count as well, and
+        # a name shared by several rules carries one shared load.
+        for ticket in tickets.values():
+            if ticket["status"] == "open" and ticket.get("assignee") in loads:
+                loads[ticket["assignee"]] += 1
+
+        def candidate_key(ticket):
+            opened_at = ticket.get("opened_at")
+            return (PRIORITY_RANK[ticket.get("priority", "normal")],
+                    opened_at is None, opened_at if opened_at is not None else 0,
+                    ticket["ticket_id"])
+
+        # Only open tickets that already have an assignee and whose category is
+        # named by a rule are candidates; missing category matches the null
+        # rule. Everything else stays exactly as it is.
+        candidates = sorted((ticket for ticket in tickets.values()
+                             if ticket["status"] == "open"
+                             and ticket.get("assignee") is not None
+                             and ticket.get("category") in covered_categories),
+                            key=candidate_key)
+        if not candidates:
+            return []
+        choices = _rebalance_plan(candidates, rule_by_category, names, loads, max_open)
+        # All transfer-time checks run before any mutation, so a single
+        # regression rejects the whole operation without partial changes.
+        for ticket, chosen in zip(candidates, choices):
+            if chosen == ticket["assignee"]:
+                continue
+            if "opened_at" in ticket and transferred_at < ticket["opened_at"]:
+                raise ValueError("transferred_at must not be earlier than opened_at")
+            history = ticket.get("transfer_history")
+            if history and transferred_at < history[-1]["transferred_at"]:
+                raise ValueError("transferred_at must not be earlier than the last transfer")
+        transferred = []
+        for ticket, chosen in zip(candidates, choices):
+            if chosen == ticket["assignee"]:
+                continue
+            ticket.setdefault("transfer_history", []).append(
+                {"from_assignee": ticket["assignee"], "to_assignee": chosen,
+                 "reason": reason, "transferred_at": transferred_at})
+            ticket["assignee"] = chosen
+            transferred.append(ticket)
+        if not transferred:
+            # A complete plan that changes nobody writes nothing: no file and
+            # no directory is created on an otherwise empty root.
+            return []
+        self._write(data)
+        return transferred
 
     def auto_categorize(self, rules):
         if not isinstance(rules, list) or not rules:

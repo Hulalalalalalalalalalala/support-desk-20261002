@@ -4377,6 +4377,239 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.stdout, "")
         self.assertIn("error", json.loads(failed.stderr))
 
+    def test_rebalance_spec_example_splits_four_with_two_transfers(self):
+        for ticket_id in ("T-1", "T-2", "T-3", "T-4"):
+            self.app.open_ticket(ticket_id, "A", "a")
+            self.app.set_category(ticket_id, "billing")
+            self.app.assign(ticket_id, "A")
+        result = self.app.rebalance_assignments(
+            [{"category": "billing", "assignees": ["A", "B"]}], "rebalance", 5)
+        # Each person keeps two tickets and only two move; the lexicographically
+        # smallest sequence keeps the earlier pair on A.
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result],
+                         [("T-3", "B"), ("T-4", "B")])
+        again = SupportDesk(self.root)
+        self.assertEqual([again.get(tid)["assignee"] for tid in
+                          ("T-1", "T-2", "T-3", "T-4")], ["A", "A", "B", "B"])
+        for ticket_id in ("T-1", "T-2"):
+            self.assertNotIn("transfer_history", again.get(ticket_id))
+        for ticket_id in ("T-3", "T-4"):
+            self.assertEqual(again.get(ticket_id)["transfer_history"],
+                             [{"from_assignee": "A", "to_assignee": "B",
+                               "reason": "rebalance", "transferred_at": 5}])
+
+    def test_rebalance_balances_across_categories_counting_unmoved_load(self):
+        for ticket_id in ("B0", "B1", "B2"):
+            self.app.open_ticket(ticket_id, "A", "a")
+            self.app.set_category(ticket_id, "billing")
+            self.app.assign(ticket_id, "X")
+        for ticket_id in ("N0", "N1"):
+            self.app.open_ticket(ticket_id, "A", "a")
+            self.app.set_category(ticket_id, "network")
+            self.app.assign(ticket_id, "X")
+        # A covered-by-no-rule ticket pinned to Y still counts toward Y's load.
+        self.app.open_ticket("F", "A", "a")
+        self.app.set_category("F", "other")
+        self.app.assign("F", "Y")
+        rules = [{"category": "billing", "assignees": ["X", "Y"]},
+                 {"category": "network", "assignees": ["X", "Y"]}]
+        result = self.app.rebalance_assignments(rules, "r", 5)
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result],
+                         [("N0", "Y"), ("N1", "Y")])
+        loads = {group["assignee"]: group["open"]
+                 for group in SupportDesk(self.root).assignee_workload_report(5)["groups"]}
+        self.assertEqual(loads, {"X": 3, "Y": 3})
+
+    def test_rebalance_orders_like_handover_and_matches_null_category(self):
+        for ticket_id, priority, opened_at in [("T-low", "low", 1), ("T-untimed", None, None),
+                                               ("T-b", None, 5), ("T-a", None, 5),
+                                               ("T-urgent", "urgent", 9)]:
+            self.app.open_ticket(ticket_id, "A", "a", opened_at=opened_at)
+            if priority is not None:
+                self.app.set_priority(ticket_id, priority)
+            self.app.assign(ticket_id, "A")
+        # One categorized ticket must be ignored by the null rule; one unassigned
+        # ticket (no assignee) must not participate either.
+        self.app.open_ticket("T-cat", "A", "a", opened_at=0)
+        self.app.set_category("T-cat", "network")
+        self.app.assign("T-cat", "A")
+        self.app.open_ticket("T-unassigned", "A", "a", opened_at=0)
+        result = self.app.rebalance_assignments(
+            [{"category": None, "assignees": ["A", "R"]}], "r", 20, max_open=10)
+        # A also keeps the uncovered network ticket, so two null tickets stay on
+        # A (the earlier ones) and the other three move to R to balance loads.
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in result],
+                         [("T-b", "R"), ("T-untimed", "R"), ("T-low", "R")])
+        self.assertEqual(self.app.get("T-urgent")["assignee"], "A")
+        self.assertEqual(self.app.get("T-a")["assignee"], "A")
+        self.assertEqual(self.app.get("T-cat")["assignee"], "A")
+        self.assertIsNone(self.app.get("T-unassigned")["assignee"])
+
+    def test_rebalance_prefers_keep_when_loads_already_balanced(self):
+        # Two on each already; the minimum-max-load plan changes nobody and
+        # writes nothing, even though moving tickets would stay balanced.
+        for ticket_id, owner in [("T1", "A"), ("T2", "A"), ("T3", "B"), ("T4", "B")]:
+            self.app.open_ticket(ticket_id, "A", "a")
+            self.app.set_category(ticket_id, "c")
+            self.app.assign(ticket_id, owner)
+        before = self.app.path.read_bytes()
+        result = self.app.rebalance_assignments(
+            [{"category": "c", "assignees": ["A", "B"]}], "r", 5)
+        self.assertEqual(result, [])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_rebalance_lexicographic_sequence_tie_break(self):
+        # Peak load and change count tied; the smallest recipient sequence wins.
+        setup = [("T1", "a", "A"), ("T2", "b", "A"), ("T3", "a", "B"), ("T4", "b", "B")]
+        for opened_at, (ticket_id, category, owner) in enumerate(setup):
+            self.app.open_ticket(ticket_id, "A", "a", opened_at=opened_at)
+            self.app.set_category(ticket_id, category)
+            self.app.assign(ticket_id, owner)
+        rules_one = [{"category": "a", "assignees": ["B", "A"]},
+                     {"category": "b", "assignees": ["A", "B"]}]
+        rules_two = [{"category": "b", "assignees": ["A", "B"]},
+                     {"category": "a", "assignees": ["A", "B"]}]
+        first = self.app.rebalance_assignments(rules_one, "r", 5)
+        # Rebuild identical state and submit rules in another order.
+        app2 = SupportDesk(self.root / "copy")
+        for opened_at, (ticket_id, category, owner) in enumerate(setup):
+            app2.open_ticket(ticket_id, "A", "a", opened_at=opened_at)
+            app2.set_category(ticket_id, category)
+            app2.assign(ticket_id, owner)
+        second = app2.rebalance_assignments(rules_two, "r", 5)
+        self.assertEqual([(t["ticket_id"], t["assignee"]) for t in first],
+                         [(t["ticket_id"], t["assignee"]) for t in second])
+
+    def test_rebalance_infeasible_capacity_rejects_without_changes(self):
+        self.app.open_ticket("T1", "A", "a", opened_at=1)
+        self.app.set_category("T1", "billing")
+        self.app.assign("T1", "A")
+        # B already holds two unmoved tickets, so a billing ticket forced to B
+        # cannot fit under max_open=2.
+        for ticket_id in ("F1", "F2"):
+            self.app.open_ticket(ticket_id, "A", "a")
+            self.app.set_category(ticket_id, "other")
+            self.app.assign(ticket_id, "B")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.rebalance_assignments(
+                [{"category": "billing", "assignees": ["B"]}], "r", 5, max_open=2)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(self.app.get("T1")["assignee"], "A")
+        self.assertNotIn("transfer_history", self.app.get("T1"))
+
+    def test_rebalance_time_regression_rejected_and_equal_allowed(self):
+        self.app.open_ticket("T1", "A", "a", opened_at=10)
+        self.app.set_category("T1", "c")
+        self.app.assign("T1", "A")
+        self.app.open_ticket("T2", "A", "a", opened_at=1)
+        self.app.set_category("T2", "c")
+        self.app.assign("T2", "A")
+        self.app.transfer_ticket("T2", "X", "old", 20)
+        self.app.transfer_ticket("T2", "A", "old", 20)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.rebalance_assignments(
+                [{"category": "c", "assignees": ["B"]}], "r", 9)
+        with self.assertRaises(ValueError):
+            self.app.rebalance_assignments(
+                [{"category": "c", "assignees": ["B"]}], "r", 19)
+        self.assertEqual(before, self.app.path.read_bytes())
+        result = self.app.rebalance_assignments(
+            [{"category": "c", "assignees": ["B"]}], "r", 20)
+        self.assertEqual([t["ticket_id"] for t in result], ["T2", "T1"])
+        self.assertEqual(len(self.app.get("T2")["transfer_history"]), 3)
+
+    def test_rebalance_empty_selection_returns_empty_without_creating(self):
+        missing = self.root / "missing"
+        rules = [{"category": "c", "assignees": ["A", "B"]}]
+        self.assertEqual(SupportDesk(missing).rebalance_assignments(rules, "r", 0), [])
+        self.assertFalse(missing.exists())
+        self.app.open_ticket("T", "A", "a")
+        self.app.assign("T", "A")
+        before = self.app.path.read_bytes()
+        # Only a rule for a category nobody has means no candidates.
+        self.assertEqual(self.app.rebalance_assignments(rules, "r", 0), [])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_rebalance_rejects_bad_input_without_writing(self):
+        self.app.open_ticket("T", "A", "a")
+        self.app.set_category("T", "c")
+        self.app.assign("T", "A")
+        good_rules = [{"category": "c", "assignees": ["A", "R"]}]
+        before = self.app.path.read_bytes()
+        for bad_rules in (None, "R", [], {}, [[]], [{"category": "c"}],
+                          [{"category": "c", "assignees": ["R"], "x": 1}],
+                          [{"category": "", "assignees": ["R"]}],
+                          [{"category": 1, "assignees": ["R"]}],
+                          [{"category": "c", "assignees": []}],
+                          [{"category": "c", "assignees": ["R", " R "]}],
+                          [{"category": "c", "assignees": ["R", 1]}],
+                          [{"category": "c", "assignees": ["R"]},
+                           {"category": " C ".lower(), "assignees": ["Q"]}]):
+            with self.assertRaises(ValueError):
+                self.app.rebalance_assignments(bad_rules, "r", 0)
+        for bad_reason in (None, "", "  ", 1):
+            with self.assertRaises(ValueError):
+                self.app.rebalance_assignments(good_rules, bad_reason, 0)
+        for bad_time in (-1, True, 1.5, "0", None):
+            with self.assertRaises(ValueError):
+                self.app.rebalance_assignments(good_rules, "r", bad_time)
+        for bad_cap in (0, -1, True, 1.5, "5", None):
+            with self.assertRaises(ValueError):
+                self.app.rebalance_assignments(good_rules, "r", 0, bad_cap)
+        with self.assertRaises(TypeError):
+            self.app.rebalance_assignments(good_rules, "r")
+        with self.assertRaises(TypeError):
+            self.app.rebalance_assignments(good_rules, "r", 0, unknown=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # Every input is still validated without candidates.
+        missing = self.root / "missing"
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).rebalance_assignments([], "r", 0)
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).rebalance_assignments(good_rules, "r", -1)
+        self.assertFalse(missing.exists())
+
+    def test_rebalance_allows_current_assignee_as_recipient(self):
+        self.app.open_ticket("T", "A", "a")
+        self.app.set_category("T", "c")
+        self.app.assign("T", "A")
+        # Unlike route-handover the current owner may be a rule recipient.
+        self.assertEqual(self.app.rebalance_assignments(
+            [{"category": "c", "assignees": ["A"]}], "r", 0), [])
+
+    def test_cli_rebalance(self):
+        self.app.open_ticket("T-1", "A", "a", opened_at=1)
+        self.app.set_category("T-1", "c")
+        self.app.assign("T-1", "A")
+        self.app.open_ticket("T-2", "A", "a", opened_at=2)
+        self.app.set_category("T-2", "c")
+        self.app.assign("T-2", "A")
+        payload = self.root / "input.json"
+        payload.write_text(json.dumps({"rules": [{"category": "c", "assignees": ["B"]}],
+                                       "reason": "r", "transferred_at": 5}),
+                           encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "rebalance", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual([t["ticket_id"] for t in value], ["T-1", "T-2"])
+        self.assertTrue(all(t["assignee"] == "B" for t in value))
+        payload.write_text(json.dumps([
+            {"rules": [{"category": "c", "assignees": ["A"]}], "reason": "r", "transferred_at": 5},
+            {"rules": [], "reason": "r", "transferred_at": 5},
+        ]), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root",
+                                 str(self.root), "rebalance", str(payload)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual(SupportDesk(self.root).get("T-1")["assignee"], "A")
+        self.assertEqual(SupportDesk(self.root).get("T-2")["assignee"], "A")
+
     def _received_ticket(self, ticket_id, opened_at=0):
         self.app.open_ticket(ticket_id, "Alice", "A", opened_at=opened_at)
         return ticket_id
