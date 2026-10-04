@@ -547,6 +547,82 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
+    def respond_many(self, items):
+        if not isinstance(items, list) or not items:
+            raise ValueError("items must be a nonempty array")
+        normalized = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict) \
+                    or not {"ticket_id", "responded_at"} <= set(item) \
+                    or not set(item) <= {"ticket_id", "responded_at", "message",
+                                         "article_id", "revision"}:
+                raise ValueError("each item must contain only ticket_id, responded_at, "
+                                 "exactly one of message or article_id and optional revision")
+            has_message = "message" in item
+            has_article = "article_id" in item
+            # Exactly one of message/article_id must be selected; both or neither
+            # reject the whole batch.
+            if has_message == has_article:
+                raise ValueError("each item must contain exactly one of message or article_id")
+            ticket_id = text(item["ticket_id"], "ticket_id")
+            responded_at = minute(item["responded_at"], "responded_at")
+            if has_message:
+                if "revision" in item:
+                    raise ValueError("revision is only allowed with article_id")
+                choice = ("message", text(item["message"], "message"))
+            else:
+                article_id = text(item["article_id"], "article_id")
+                revision = item.get("revision")
+                if revision is not None:
+                    revision = positive(revision, "revision")
+                choice = ("knowledge", article_id, revision)
+            if ticket_id in seen:
+                raise ValueError("items must not contain duplicate ticket ids")
+            seen.add(ticket_id)
+            normalized.append((ticket_id, responded_at, choice))
+        data = self._read()
+        tickets = data.get("tickets", {})
+        targets = []
+        # Validate every selected ticket and knowledge reference before mutating
+        # any, so a rejected batch leaves every first response untouched and
+        # writes no directory or file.
+        for ticket_id, responded_at, choice in normalized:
+            ticket = tickets.get(ticket_id)
+            if ticket is None or ticket["status"] == "closed":
+                raise ValueError("ticket must exist and be open")
+            if "opened_at" not in ticket:
+                raise ValueError("ticket has no opened_at")
+            response = ticket.get("first_response")
+            # Missing, null or an empty object means the ticket still awaits its
+            # first response; only a non-empty object blocks registration.
+            if isinstance(response, dict) and response:
+                raise ValueError("ticket already has a first response")
+            if responded_at < ticket["opened_at"]:
+                raise ValueError("responded_at must not be earlier than opened_at")
+            if choice[0] == "knowledge":
+                _, article_id, revision = choice
+                snapshot, chosen_revision = self._knowledge_snapshot(data, article_id, revision)
+                choice = ("knowledge", snapshot, chosen_revision)
+            targets.append((ticket, responded_at, choice))
+        responded = []
+        for ticket, responded_at, choice in targets:
+            if choice[0] == "message":
+                ticket["first_response"] = {"message": choice[1], "responded_at": responded_at}
+            else:
+                _, snapshot, chosen_revision = choice
+                record = {
+                    "message": snapshot["content"],
+                    "responded_at": responded_at,
+                    "knowledge": snapshot,
+                }
+                if chosen_revision is not None:
+                    record["knowledge_revision"] = chosen_revision
+                ticket["first_response"] = record
+            responded.append(ticket)
+        self._write(data)
+        return responded
+
     def _reply_target(self, data, ticket_id):
         ticket = data.get("tickets", {}).get(ticket_id)
         if ticket is None or ticket["status"] == "closed":
