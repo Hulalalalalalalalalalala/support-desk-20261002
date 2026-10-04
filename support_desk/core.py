@@ -1007,6 +1007,119 @@ class SupportDesk(JsonStore):
         }
         return {"as_of": as_of, "summary": summary, "items": items}
 
+    def customer_response_target_report(self, as_of, since=0, until=None, targets=None,
+                                        service_periods=None):
+        # Parameters are validated even when the store holds no data.
+        as_of = minute(as_of, "as_of")
+        since = minute(since, "since")
+        if until is not None:
+            until = minute(until, "until")
+            if until < since:
+                raise ValueError("until must not be earlier than since")
+        target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
+        if targets is not None:
+            if not isinstance(targets, dict):
+                raise ValueError("targets must be an object or null")
+            for priority, value in targets.items():
+                if priority not in PRIORITY_RANK:
+                    raise ValueError("targets has an unknown priority: " + str(priority))
+                target_minutes[priority] = positive(value, "targets." + priority)
+        periods = _service_periods(service_periods)
+        tickets = list(self._read().get("tickets", {}).values())
+        # Only tickets with a follow-up history can contribute; open and closed tickets alike.
+        participants = [ticket for ticket in tickets if ticket.get("customer_messages")]
+        answers = {}
+        windowed = {}
+        for ticket in participants:
+            # The window selects follow-ups by received time only: since is
+            # inclusive, until exclusive and omitted/null means no upper bound;
+            # equal bounds make the interval empty.
+            pairs = [(index, message) for index, message in enumerate(ticket["customer_messages"])
+                     if message["received_at"] >= since
+                     and (until is None or message["received_at"] < until)]
+            # A ticket without a selected follow-up takes no part in the query.
+            if not pairs:
+                continue
+            response = ticket.get("first_response")
+            # Missing, null or an empty object means there is no first response;
+            # handwritten and knowledge answers are collected the same way. The
+            # answer set ignores the window: an answer outside it may still cover
+            # a selected follow-up.
+            times = [response["responded_at"]] if isinstance(response, dict) and response else []
+            times.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
+            # A selected follow-up, or any answer of the same ticket, later than
+            # as_of invalidates the whole query; follow-ups outside the window
+            # and tickets without a selected follow-up are never checked. Empty
+            # service periods do not waive this check.
+            if any(message["received_at"] > as_of for _, message in pairs) or \
+                    any(time > as_of for time in times):
+                raise ValueError("customer message or response time must not be later than as_of")
+            answers[ticket["ticket_id"]] = times
+            windowed[ticket["ticket_id"]] = pairs
+        # One entry per selected follow-up; duplicate follow-up records count
+        # independently and one answer may cover several of them.
+        entries = []
+        for ticket in participants:
+            ticket_id = ticket["ticket_id"]
+            pairs = windowed.get(ticket_id)
+            if not pairs:
+                continue
+            priority = ticket.get("priority", "normal")
+            for index, message in pairs:
+                received_at = message["received_at"]
+                # Matching looks at time only: the earliest answer not earlier than
+                # the follow-up covers it, regardless of call order or window bounds;
+                # equal times take zero minutes.
+                candidates = [time for time in answers[ticket_id] if time >= received_at]
+                if candidates:
+                    answered_at = min(candidates)
+                    if periods is None:
+                        elapsed = answered_at - received_at
+                    else:
+                        # Only minutes covered by a service period count; periods
+                        # before receipt or after the answer contribute nothing.
+                        elapsed = _service_minutes(periods, received_at, answered_at)
+                    entries.append((priority, "answered", elapsed))
+                elif ticket["status"] == "closed":
+                    # Closed tickets whose follow-up stays unanswered count
+                    # separately and never count as overdue.
+                    entries.append((priority, "closed_without_answer", None))
+                else:
+                    if periods is None:
+                        elapsed = as_of - received_at
+                    else:
+                        elapsed = _service_minutes(periods, received_at, as_of)
+                    entries.append((priority, "pending", elapsed))
+        groups = []
+        for priority_name in PRIORITIES:
+            target = target_minutes[priority_name]
+            counts = {"total": 0, "answered": 0, "on_time": 0, "late": 0,
+                      "pending": 0, "overdue": 0, "closed_without_answer": 0}
+            for entry_priority, outcome, elapsed in entries:
+                if entry_priority != priority_name:
+                    continue
+                counts["total"] += 1
+                if outcome == "answered":
+                    counts["answered"] += 1
+                    # Meeting the target exactly counts as on time; only greater
+                    # elapsed minutes are late.
+                    if elapsed <= target:
+                        counts["on_time"] += 1
+                    else:
+                        counts["late"] += 1
+                elif outcome == "closed_without_answer":
+                    counts["closed_without_answer"] += 1
+                else:
+                    counts["pending"] += 1
+                    # Overdue wait must strictly exceed the target.
+                    if elapsed > target:
+                        counts["overdue"] += 1
+            # on_time is a subset of answered; overdue is a subset of pending.
+            rate = counts["on_time"] / counts["answered"] if counts["answered"] else None
+            groups.append({"priority": priority_name, "target_minutes": target, **counts,
+                           "on_time_rate": rate})
+        return {"as_of": as_of, "groups": groups}
+
     def response_target_report(self, as_of, targets=None, since=None, until=None, service_periods=None):
         as_of = minute(as_of, "as_of")
         target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
