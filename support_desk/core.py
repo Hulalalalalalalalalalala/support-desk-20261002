@@ -7,10 +7,129 @@ _UNSET = object()
 
 
 class _Edge:
-    __slots__ = ("to", "rev", "cap")
+    __slots__ = ("to", "rev", "cap", "cost")
 
-    def __init__(self, to, rev, cap):
-        self.to, self.rev, self.cap = to, rev, cap
+    def __init__(self, to, rev, cap, cost=0):
+        self.to, self.rev, self.cap, self.cost = to, rev, cap, cost
+
+
+def _rebalance_flow(candidates, options, base_loads, names, ceiling, costs=False):
+    # Bipartite flow: every candidate ticket sends one unit to one allowed
+    # name. A name finally holds (base_load - own candidates) plus the units
+    # it receives, so its sink capacity is ceiling minus the tickets that can
+    # never leave it plus its own candidates. Returns one chosen name per
+    # candidate, or None when the flow cannot saturate every ticket. With
+    # costs=True the min-cost flow first minimizes changed owners and then the
+    # case-sensitive recipient name sequence in candidate order.
+    n = len(candidates)
+    m = len(names)
+    own = {name: 0 for name in names}
+    for ticket in candidates:
+        if ticket["assignee"] in own:
+            own[ticket["assignee"]] += 1
+    caps = {}
+    for name in names:
+        capacity = ceiling - base_loads[name] + own[name]
+        if capacity < 0:
+            return None
+        caps[name] = capacity
+    source = 0
+    name0 = 1 + n
+    sink = name0 + m
+
+    def build():
+        graph = [[] for _ in range(sink + 1)]
+
+        def add_edge(head, tail, cap, cost=0):
+            graph[head].append(_Edge(tail, len(graph[tail]), cap, cost))
+            graph[tail].append(_Edge(head, len(graph[head]) - 1, 0, -cost))
+
+        choice_edges = [[] for _ in range(n)]
+        for i in range(n):
+            add_edge(source, 1 + i, 1)
+        rank = {name: pos for pos, name in enumerate(names)}
+        if costs:
+            # Digits in this base encode the recipient sequence with the first
+            # candidate as the most significant digit; one owner change weighs
+            # more than every sequence digit combined.
+            base = m if m >= 2 else 2
+            change_weight = base ** n
+        for i in range(n):
+            current = candidates[i]["assignee"]
+            for name in options[i]:
+                if costs:
+                    change = 1 if name != current else 0
+                    cost = change * change_weight + rank[name] * base ** (n - 1 - i)
+                else:
+                    cost = 0
+                forward = _Edge(name0 + rank[name],
+                                len(graph[name0 + rank[name]]), 1, cost)
+                graph[1 + i].append(forward)
+                graph[name0 + rank[name]].append(
+                    _Edge(1 + i, len(graph[1 + i]) - 1, 0, -cost))
+                choice_edges[i].append((name, forward))
+        for name in names:
+            add_edge(name0 + rank[name], sink, caps[name])
+        return graph, choice_edges
+
+    graph, choice_edges = build()
+    for _ in range(n):
+        # SPFA shortest augmenting path: residual reverse edges carry negative
+        # costs after earlier augmentations, so Bellman-Ford queueing applies.
+        dist = [None] * (sink + 1)
+        prev_node = [None] * (sink + 1)
+        prev_edge = [None] * (sink + 1)
+        dist[source] = 0
+        queue = [source]
+        for node in queue:
+            for pos, edge in enumerate(graph[node]):
+                if edge.cap <= 0:
+                    continue
+                nd = dist[node] + edge.cost
+                if dist[edge.to] is None or nd < dist[edge.to]:
+                    dist[edge.to] = nd
+                    prev_node[edge.to] = node
+                    prev_edge[edge.to] = pos
+                    queue.append(edge.to)
+        if dist[sink] is None:
+            return None
+        node = sink
+        while node != source:
+            prev = prev_node[node]
+            edge = graph[prev][prev_edge[node]]
+            edge.cap -= 1
+            graph[node][edge.rev].cap += 1
+            node = prev
+    choices = []
+    for i in range(n):
+        chosen = next((name for name, edge in choice_edges[i] if edge.cap == 0), None)
+        if chosen is None:
+            return None
+        choices.append(chosen)
+    return choices
+
+
+def _rebalance_plan(candidates, options, base_loads, max_open):
+    # Phase 1: find the smallest feasible per-name ceiling (the minimized
+    # largest final total); phase 2: among plans at that ceiling, minimize the
+    # number of changed owners and then the recipient name sequence.
+    names = sorted(base_loads)
+    own = {name: 0 for name in names}
+    for ticket in candidates:
+        if ticket["assignee"] in own:
+            own[ticket["assignee"]] += 1
+    lower = max([base_loads[name] - own[name] for name in names] + [0])
+    if lower > max_open or _rebalance_flow(candidates, options, base_loads,
+                                           names, max_open) is None:
+        return None
+    lo, hi = lower, max_open
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _rebalance_flow(candidates, options, base_loads, names, mid) is None:
+            lo = mid + 1
+        else:
+            hi = mid
+    return _rebalance_flow(candidates, options, base_loads, names, lo, costs=True)
 
 
 def _route_coverage(candidates, rule_by_category, loads, limits):
@@ -2015,6 +2134,91 @@ class SupportDesk(JsonStore):
             handed_over.append(ticket)
         self._write(data)
         return handed_over
+
+    def rebalance_assignments(self, rules, reason, transferred_at, max_open=5):
+        # Rules reuse route-assign's format, normalization and validation; the
+        # current owner of a ticket may appear among a rule's recipients.
+        if not isinstance(rules, list) or not rules:
+            raise ValueError("rules must be a nonempty array")
+        normalized = []
+        categories = set()
+        for rule in rules:
+            if not isinstance(rule, dict) or set(rule) != {"category", "assignees"}:
+                raise ValueError("each rule must be an object with only category and assignees")
+            category = rule["category"]
+            if category is not None:
+                if not isinstance(category, str) or not category.strip():
+                    raise ValueError("rule category must be null or a nonblank string")
+                category = category.strip()
+            if category in categories:
+                raise ValueError("rules must not contain duplicate categories")
+            categories.add(category)
+            raw_assignees = rule["assignees"]
+            if not isinstance(raw_assignees, list) or not raw_assignees:
+                raise ValueError("assignees must be a nonempty array")
+            names = []
+            for element in raw_assignees:
+                if not isinstance(element, str) or not element.strip():
+                    raise ValueError("assignees elements must be nonblank strings")
+                names.append(element.strip())
+            if len(set(names)) != len(names):
+                raise ValueError("assignees must not contain duplicate names")
+            normalized.append((category, names))
+        reason = text(reason, "reason")
+        transferred_at = minute(transferred_at, "transferred_at")
+        max_open = positive(max_open, "max_open")
+        data = self._read()
+        tickets = data.get("tickets", {})
+        rule_by_category = {category: names for category, names in normalized}
+        base_loads = {}
+        for _, names in normalized:
+            for name in names:
+                base_loads.setdefault(name, 0)
+        # Load is the final per-person total of open tickets; tickets that take
+        # no part in the rebalance still count, and a name shared by rules
+        # carries one shared load across categories.
+        for ticket in tickets.values():
+            if ticket["status"] == "open" and ticket.get("assignee") in base_loads:
+                base_loads[ticket["assignee"]] += 1
+
+        def candidate_key(ticket):
+            opened_at = ticket.get("opened_at")
+            return (PRIORITY_RANK[ticket.get("priority", "normal")],
+                    opened_at is None, opened_at if opened_at is not None else 0,
+                    ticket["ticket_id"])
+
+        candidates = sorted((ticket for ticket in tickets.values()
+                             if ticket["status"] == "open" and ticket.get("assignee")
+                             and ticket.get("category") in rule_by_category),
+                            key=candidate_key)
+        if not candidates:
+            return []
+        options = [sorted(rule_by_category[ticket.get("category")]) for ticket in candidates]
+        choices = _rebalance_plan(candidates, options, base_loads, max_open)
+        if choices is None:
+            raise ValueError("rules do not cover all selected tickets within capacity")
+        moves = [(ticket, chosen) for ticket, chosen in zip(candidates, choices)
+                 if chosen != ticket["assignee"]]
+        if not moves:
+            return []
+        # Only tickets that actually change owner are registered as transfers;
+        # every time is checked before any mutation, so a rejected rebalance
+        # leaves all owners and histories untouched and writes no file.
+        for ticket, _ in moves:
+            if "opened_at" in ticket and transferred_at < ticket["opened_at"]:
+                raise ValueError("transferred_at must not be earlier than opened_at")
+            history = ticket.get("transfer_history")
+            if history and transferred_at < history[-1]["transferred_at"]:
+                raise ValueError("transferred_at must not be earlier than the last transfer")
+        transferred = []
+        for ticket, chosen in moves:
+            ticket.setdefault("transfer_history", []).append(
+                {"from_assignee": ticket["assignee"], "to_assignee": chosen,
+                 "reason": reason, "transferred_at": transferred_at})
+            ticket["assignee"] = chosen
+            transferred.append(ticket)
+        self._write(data)
+        return transferred
 
     def auto_categorize(self, rules):
         if not isinstance(rules, list) or not rules:
