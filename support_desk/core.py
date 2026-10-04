@@ -667,6 +667,68 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
+    def reply_many(self, items):
+        # Append follow-up replies for an explicitly selected set of tickets in
+        # one atomic batch: every reply is saved together, or validation leaves
+        # every ticket, the store directory and the data file untouched.
+        if not isinstance(items, list) or not items:
+            raise ValueError("items must be a nonempty array")
+        allowed = {"ticket_id", "replied_at", "message", "article_id", "revision"}
+        normalized = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict) or not {"ticket_id", "replied_at"} <= set(item) \
+                    or not set(item) <= allowed \
+                    or ("message" in item) == ("article_id" in item):
+                # Exactly one of message and article_id must be present; revision
+                # may only accompany a knowledge reference, so any other key (or
+                # neither/both bodies) rejects the whole group.
+                raise ValueError("each item must contain ticket_id, replied_at and exactly one of message or article_id")
+            ticket_id = text(item["ticket_id"], "ticket_id")
+            replied_at = minute(item["replied_at"], "replied_at")
+            if ticket_id in seen:
+                raise ValueError("items must not contain duplicate ticket ids")
+            seen.add(ticket_id)
+            if "message" in item:
+                if "revision" in item:
+                    raise ValueError("revision is allowed only with article_id")
+                body = text(item["message"], "message")
+                normalized.append((ticket_id, replied_at, ("manual", body)))
+            else:
+                article_id = text(item["article_id"], "article_id")
+                raw_revision = item.get("revision")
+                revision = None if raw_revision is None else positive(raw_revision, "revision")
+                normalized.append((ticket_id, replied_at, ("knowledge", article_id, revision)))
+        data = self._read()
+        tickets = data.get("tickets", {})
+        targets = []
+        # Resolve and validate every selected ticket, time and knowledge
+        # reference before mutating anything, so a rejected batch writes no
+        # directory or file and leaves no partial reply (e.g. a disabled article
+        # on the last item keeps every earlier ticket unchanged).
+        for ticket_id, replied_at, choice in normalized:
+            ticket = self._reply_target(data, ticket_id)
+            if choice[0] == "manual":
+                self._check_reply_time(ticket, replied_at)
+                record = {"message": choice[1], "replied_at": replied_at}
+            else:
+                snapshot, chosen_revision = self._knowledge_snapshot(data, choice[1], choice[2])
+                self._check_reply_time(ticket, replied_at)
+                record = {
+                    "message": snapshot["content"],
+                    "replied_at": replied_at,
+                    "knowledge": snapshot,
+                }
+                if chosen_revision is not None:
+                    record["knowledge_revision"] = chosen_revision
+            targets.append((ticket, record))
+        replied = []
+        for ticket, record in targets:
+            ticket.setdefault("replies", []).append(record)
+            replied.append(ticket)
+        self._write(data)
+        return replied
+
     def receive(self, ticket_id, message, received_at):
         ticket_id, message = text(ticket_id, "ticket_id"), text(message, "message")
         received_at = minute(received_at, "received_at")
