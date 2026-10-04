@@ -1154,6 +1154,75 @@ class SupportDesk(JsonStore):
             "max_minutes": max(durations) if durations else None,
         }
 
+    def closure_target_report(self, as_of, targets=None, service_periods=None):
+        # Parameters are validated even when the store holds no data.
+        as_of = minute(as_of, "as_of")
+        target_minutes = {"urgent": 60, "high": 120, "normal": 240, "low": 480}
+        if targets is not None:
+            if not isinstance(targets, dict):
+                raise ValueError("targets must be an object or null")
+            for priority, value in targets.items():
+                if priority not in PRIORITY_RANK:
+                    raise ValueError("targets has an unknown priority: " + str(priority))
+                target_minutes[priority] = positive(value, "targets." + priority)
+        periods = _service_periods(service_periods)
+        tickets = list(self._read().get("tickets", {}).values())
+        for ticket in tickets:
+            # Every registration time, and the close time of every currently
+            # closed ticket, must not be later than as_of; equal times are
+            # allowed. Response, follow-up, transfer and reopen-history times
+            # play no part in this check.
+            opened_at = ticket.get("opened_at")
+            if opened_at is not None and opened_at > as_of:
+                raise ValueError("opened_at must not be later than as_of")
+            if ticket["status"] == "closed":
+                closed_at = ticket.get("closed_at")
+                if closed_at is not None and closed_at > as_of:
+                    raise ValueError("closed_at must not be later than as_of")
+        groups = []
+        for priority in PRIORITIES:
+            target = target_minutes[priority]
+            counts = {"completed": 0, "on_time": 0, "late": 0, "pending": 0,
+                      "overdue": 0, "untimed": 0}
+            for ticket in tickets:
+                if ticket.get("priority", "normal") != priority:
+                    continue
+                opened_at = ticket.get("opened_at")
+                if ticket["status"] == "closed" and opened_at is not None \
+                        and ticket.get("closed_at") is not None:
+                    counts["completed"] += 1
+                    if periods is None:
+                        elapsed = ticket["closed_at"] - opened_at
+                    else:
+                        # Only minutes covered by a service period count; periods
+                        # before registration or after closure contribute nothing,
+                        # and an empty period list leaves the elapsed time at zero.
+                        elapsed = _service_minutes(periods, opened_at, ticket["closed_at"])
+                    # Meeting the target exactly counts as on time.
+                    if elapsed <= target:
+                        counts["on_time"] += 1
+                    else:
+                        counts["late"] += 1
+                elif ticket["status"] != "closed" and opened_at is not None:
+                    # Reopened tickets count by their current open state; timing
+                    # still starts at the original registration and historical
+                    # closures are neither counted nor deducted.
+                    counts["pending"] += 1
+                    if periods is None:
+                        elapsed = as_of - opened_at
+                    else:
+                        elapsed = _service_minutes(periods, opened_at, as_of)
+                    # Overdue wait must strictly exceed the target.
+                    if elapsed > target:
+                        counts["overdue"] += 1
+                else:
+                    counts["untimed"] += 1
+            # on_time is a subset of completed; overdue is a subset of pending.
+            rate = counts["on_time"] / counts["completed"] if counts["completed"] else None
+            groups.append({"priority": priority, "target_minutes": target, **counts,
+                           "on_time_rate": rate})
+        return {"as_of": as_of, "groups": groups}
+
     def response_queue(self, as_of, target_minutes=30):
         as_of = minute(as_of, "as_of")
         target_minutes = positive(target_minutes, "target_minutes")
