@@ -746,6 +746,40 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
+    def receive_once(self, ticket_id, message, received_at, request_id):
+        ticket_id, message = text(ticket_id, "ticket_id"), text(message, "message")
+        request_id = text(request_id, "request_id")
+        received_at = minute(received_at, "received_at")
+        data = self._read()
+        tickets = data.get("tickets", {})
+        # Request ids are unique per ticket within a root, so the same id may be
+        # registered independently on different tickets. The association lives in
+        # root/data.json but outside customer_messages, whose records keep only
+        # message and received_at.
+        records = data.get("receive_requests", {}).get(ticket_id)
+        registered = records.get(request_id) if records is not None else None
+        if registered is not None:
+            # A matching retry writes nothing and returns the current ticket, even
+            # after later follow-ups, replies, closure or reopening; a changed body
+            # or time is rejected. Plain receive records never take part in dedup.
+            if message != registered["message"] or received_at != registered["received_at"]:
+                raise ValueError("request_id was already registered with a different body or time")
+            return {"ticket": tickets[ticket_id], "created": False}
+        ticket = tickets.get(ticket_id)
+        if ticket is None or ticket["status"] != "open" or "opened_at" not in ticket:
+            raise ValueError("ticket must exist, be open and have opened_at")
+        if received_at < ticket["opened_at"]:
+            raise ValueError("received_at must not be earlier than opened_at")
+        messages = ticket.get("customer_messages")
+        if messages and received_at < messages[-1]["received_at"]:
+            raise ValueError("received_at must not be earlier than the last customer message")
+        ticket.setdefault("customer_messages", []).append(
+            {"message": message, "received_at": received_at})
+        data.setdefault("receive_requests", {}).setdefault(ticket_id, {})[request_id] = \
+            {"message": message, "received_at": received_at}
+        self._write(data)
+        return {"ticket": ticket, "created": True}
+
     def response_stats(self):
         tickets = list(self._read().get("tickets", {}).values())
         timed = [t for t in tickets if "opened_at" in t]

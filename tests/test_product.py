@@ -4455,6 +4455,182 @@ class ProductTests(unittest.TestCase):
             app.receive("T", "m", 6)
         self.assertFalse(fresh.exists())
 
+    def test_receive_once_registers_and_persists_association(self):
+        self._received_ticket("T", 5)
+        result = self.app.receive_once(" T ", "  还没好\n请尽快!  ", 10, " req-1 ")
+        self.assertEqual(set(result), {"ticket", "created"})
+        self.assertTrue(result["created"])
+        ticket = result["ticket"]
+        self.assertEqual(ticket["customer_messages"],
+                         [{"message": "还没好\n请尽快!", "received_at": 10}])
+        self.assertEqual(set(ticket["customer_messages"][0]), {"message", "received_at"})
+        self.assertEqual(ticket, self.app.get("T"))
+        # the association lives at root level, not inside the ticket or the record
+        self.assertNotIn("request_id", ticket["customer_messages"][0])
+        self.assertNotIn("receive_requests", ticket)
+        data = self.app._read()
+        self.assertIn("req-1", data["receive_requests"]["T"])
+        reloaded = SupportDesk(self.root)
+        retry = reloaded.receive_once("T", "还没好\n请尽快!", 10, "req-1")
+        self.assertFalse(retry["created"])
+        self.assertEqual(retry["ticket"], reloaded.get("T"))
+        self.assertEqual(len(retry["ticket"]["customer_messages"]), 1)
+
+    def test_receive_once_field_is_added_only_on_first_success(self):
+        self._received_ticket("T", 5)
+        self.assertNotIn("customer_messages", self.app.get("T"))
+        self.assertNotIn("receive_requests", self.app._read())
+        self.app.receive_once("T", "m", 6, "r1")
+        self.assertIn("customer_messages", self.app.get("T"))
+        self.assertIn("receive_requests", self.app._read())
+
+    def test_receive_once_retry_does_not_write_even_as_ticket_changes(self):
+        self._received_ticket("T", 0)
+        self.assertTrue(self.app.receive_once("T", "first", 5, "r1")["created"])
+        before = self.app.path.read_bytes()
+        # later follow-ups (including plain receive), replies, closure, reopening
+        self.app.receive("T", "later", 8)
+        self.app.assign("T", "Eve")
+        self.app.respond("T", "answer", 9)
+        self.app.close("T", "done")
+        self.app.reopen_ticket("T", "again")
+        after_changes = self.app.path.read_bytes()
+        self.assertNotEqual(before, after_changes)
+        result = self.app.receive_once("T", "first", 5, "r1")
+        self.assertFalse(result["created"])
+        self.assertEqual(result["ticket"], self.app.get("T"))
+        self.assertEqual(result["ticket"]["status"], "open")
+        self.assertEqual(after_changes, self.app.path.read_bytes())
+        self.assertEqual([m["received_at"] for m in result["ticket"]["customer_messages"]], [5, 8])
+
+    def test_receive_once_same_id_on_other_ticket_is_independent(self):
+        self._received_ticket("A", 0)
+        self._received_ticket("B", 1)
+        self.assertTrue(self.app.receive_once("A", "msg", 5, "shared")["created"])
+        result = self.app.receive_once("B", "msg", 5, "shared")
+        self.assertTrue(result["created"])
+        self.assertEqual(len(result["ticket"]["customer_messages"]), 1)
+        # retry on each keeps its own dedup scope
+        self.assertFalse(self.app.receive_once("A", "msg", 5, "shared")["created"])
+        self.assertFalse(self.app.receive_once("B", "msg", 5, "shared")["created"])
+
+    def test_receive_once_case_sensitive_ids_and_trimmed_lookup(self):
+        self._received_ticket("T", 0)
+        self.assertTrue(self.app.receive_once("T", "m", 5, "Req")["created"])
+        self.assertTrue(self.app.receive_once("T", "n", 6, "req")["created"])
+        with self.assertRaises(ValueError):
+            self.app.receive_once("t", "m", 5, "Req")
+        self.assertFalse(self.app.receive_once(" T ", "m", 5, " Req ")["created"])
+
+    def test_receive_once_changed_body_or_time_is_rejected_without_write(self):
+        self._received_ticket("T", 0)
+        self.app.receive_once("T", "  body  ", 5, "r1")
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.receive_once("T", "other", 5, "r1")
+        with self.assertRaises(ValueError):
+            self.app.receive_once("T", "body", 6, "r1")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertEqual(len(self.app.get("T")["customer_messages"]), 1)
+        # outer whitespace does not matter; the normalized body still matches
+        self.assertFalse(self.app.receive_once("T", "  body  ", 5, "r1")["created"])
+
+    def test_receive_once_plain_receive_records_do_not_dedup(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "same", 5)
+        result = self.app.receive_once("T", "same", 5, "r1")
+        self.assertTrue(result["created"])
+        self.assertEqual(len(result["ticket"]["customer_messages"]), 2)
+        # the same body and time from plain receive cannot satisfy the retry either
+        self.app.receive("T", "twice", 6)
+        self.assertTrue(self.app.receive_once("T", "twice", 6, "r2")["created"])
+
+    def test_receive_once_checks_open_ticket_opened_at_and_time_order(self):
+        self._received_ticket("T-open", 5)
+        self.app.open_ticket("T-untimed", "Bob", "B")
+        self.app.open_ticket("T-closed", "Cara", "C", opened_at=5)
+        self.app.assign("T-closed", "Eve")
+        self.app.respond("T-closed", "Seen", 6)
+        self.app.close("T-closed", "Done")
+        self.assertTrue(self.app.receive_once("T-open", "m", 5, "r0")["created"])
+        self.assertTrue(self.app.receive_once("T-open", "same minute", 5, "r1")["created"])
+        for ticket_id in ("missing", "T-untimed", "T-closed"):
+            with self.assertRaises(ValueError, msg=ticket_id):
+                self.app.receive_once(ticket_id, "m", 6, "rx-" + ticket_id)
+        with self.assertRaises(ValueError):
+            self.app.receive_once("T-open", "too early", 4, "r2")
+        with self.assertRaises(ValueError):
+            self.app.receive_once("T-open", "regress", 4, "r3")
+        # failed registrations do not occupy the request id
+        self.assertTrue(self.app.receive_once("T-open", "regress fixed", 7, "r3")["created"])
+        self.assertEqual(
+            [m["received_at"] for m in self.app.get("T-open")["customer_messages"]], [5, 5, 7])
+
+    def test_receive_once_rejects_bad_input_without_writing_or_reserving_id(self):
+        self._received_ticket("T", 5)
+        self.app.receive_once("T", "ok", 6, "r0")
+        before = self.app.path.read_bytes()
+        for ticket_id, message, received_at, request_id in [
+            (None, "m", 6, "r"), (1, "m", 6, "r"), (" ", "m", 6, "r"),
+            ("T", None, 6, "r"), ("T", 1, 6, "r"), ("T", " ", 6, "r"),
+            ("T", "m", 6, None), ("T", "m", 6, 1), ("T", "m", 6, " "),
+            ("T", "m", -1, "r"), ("T", "m", True, "r"), ("T", "m", 1.5, "r"),
+            ("T", "m", "6", "r"), ("T", "m", None, "r"),
+        ]:
+            with self.assertRaises(ValueError, msg=(ticket_id, message, received_at, request_id)):
+                self.app.receive_once(ticket_id, message, received_at, request_id)
+        with self.assertRaises(TypeError):
+            self.app.receive_once("T", "m", 6)
+        with self.assertRaises(TypeError):
+            self.app.receive_once("T", "m")
+        with self.assertRaises(TypeError):
+            self.app.receive_once("T")
+        with self.assertRaises(TypeError):
+            self.app.receive_once("T", "m", 6, "r", "extra")
+        self.assertEqual(before, self.app.path.read_bytes())
+        # the rejected id was never reserved
+        self.assertTrue(self.app.receive_once("T", "fresh", 7, "r")["created"])
+
+    def test_receive_once_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.receive_once("T", "m", 6, "r")
+        self.assertFalse(fresh.exists())
+
+    def test_cli_receive_once_object_and_array_semantics(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        payload = self.root / "once.json"
+        payload.write_text(json.dumps(
+            {"ticket_id": "T", "message": "q1", "received_at": 5, "request_id": "r1"}),
+            encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-m", "support_desk", "--root", str(self.root),
+             "receive-once", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(set(value), {"ticket", "created"})
+        self.assertTrue(value["created"])
+        # identical retry: created false, no new record
+        retry = subprocess.run(
+            [sys.executable, "-m", "support_desk", "--root", str(self.root),
+             "receive-once", str(payload)], text=True, capture_output=True)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertFalse(json.loads(retry.stdout)["created"])
+        # array: earlier success survives a later failing item
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"ticket_id": "T", "message": "q2", "received_at": 6, "request_id": "r2"},
+            {"ticket_id": "missing", "message": "q3", "received_at": 6, "request_id": "r3"},
+        ]), encoding="utf-8")
+        failed = subprocess.run(
+            [sys.executable, "-m", "support_desk", "--root", str(self.root),
+             "receive-once", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual([m["received_at"] for m in self.app.get("T")["customer_messages"]], [5, 6])
+
     def test_customer_queue_counts_waiting_and_overdue_boundary(self):
         self._received_ticket("T", 0)
         self.app.respond("T", "answer", 10)
