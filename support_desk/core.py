@@ -1120,6 +1120,75 @@ class SupportDesk(JsonStore):
                            "on_time_rate": rate})
         return {"as_of": as_of, "groups": groups}
 
+    def customer_response_target_queue(self, as_of, targets=None, service_periods=None):
+        # Parameters are validated even when the store holds no data.
+        as_of = minute(as_of, "as_of")
+        target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}
+        if targets is not None:
+            if not isinstance(targets, dict):
+                raise ValueError("targets must be an object or null")
+            for priority, value in targets.items():
+                if priority not in PRIORITY_RANK:
+                    raise ValueError("targets has an unknown priority: " + str(priority))
+                target_minutes[priority] = positive(value, "targets." + priority)
+        periods = _service_periods(service_periods)
+        items = []
+        for ticket in self._read().get("tickets", {}).values():
+            # Only open tickets with a follow-up history participate; closed
+            # tickets and tickets without follow-ups skip every time check.
+            # Assignment and a missing registration time never matter.
+            if ticket["status"] != "open":
+                continue
+            messages = ticket.get("customer_messages")
+            if not messages:
+                continue
+            response = ticket.get("first_response")
+            # Missing, null or an empty object means there is no first response;
+            # missing histories count as empty records and are never backfilled.
+            has_response = isinstance(response, dict) and bool(response)
+            answer_times = ([response["responded_at"]] if has_response else [])
+            answer_times.extend(reply["replied_at"] for reply in ticket.get("replies") or [])
+            # Any follow-up or answer later than as_of invalidates the whole
+            # query, even when every follow-up is already covered; empty service
+            # periods do not waive this check.
+            if any(message["received_at"] > as_of for message in messages) or \
+                    any(time > as_of for time in answer_times):
+                raise ValueError("customer message or response time must not be later than as_of")
+            # The answer boundary is the latest of the first response and all
+            # later replies; with no answer every follow-up stays unanswered. A
+            # follow-up in the same minute as the boundary is already covered;
+            # duplicate follow-ups are counted separately.
+            boundary = max(answer_times) if answer_times else None
+            unanswered = [message["received_at"] for message in messages
+                          if boundary is None or message["received_at"] > boundary]
+            if not unanswered:
+                continue
+            earliest = min(unanswered)
+            target = target_minutes[ticket.get("priority", "normal")]
+            if periods is None:
+                waiting = as_of - earliest
+                due_at = earliest + target
+            else:
+                # Only minutes covered by a service period count; merged periods
+                # make overlapping, repeated and touching intervals count once.
+                waiting = _service_minutes(periods, earliest, as_of)
+                # The due simulation may run beyond as_of using the periods given,
+                # and the end of a period is a valid answer; coverage that can
+                # never reach the target (an empty list included) leaves due_at null.
+                due_at = _due_minute(periods, earliest, target)
+            items.append({"ticket": ticket, "count": len(unanswered),
+                          "waiting_minutes": waiting, "due_at": due_at,
+                          "overdue": waiting > target})
+        # Overdue tickets first, then urgent/high/normal/low (missing priority is
+        # normal), then ascending due time with nulls last, finally the
+        # case-sensitive ticket id.
+        items.sort(key=lambda item: (not item["overdue"],
+                                     PRIORITY_RANK[item["ticket"].get("priority", "normal")],
+                                     item["due_at"] is None,
+                                     item["due_at"] if item["due_at"] is not None else 0,
+                                     item["ticket"]["ticket_id"]))
+        return {"as_of": as_of, "items": items}
+
     def response_target_report(self, as_of, targets=None, since=None, until=None, service_periods=None):
         as_of = minute(as_of, "as_of")
         target_minutes = {"urgent": 5, "high": 15, "normal": 30, "low": 60}

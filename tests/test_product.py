@@ -1176,6 +1176,275 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), {"untimed": 0, "items": []})
         self.assertFalse(missing.exists())
 
+    def test_customer_response_target_queue_natural_minutes_boundary_and_shape(self):
+        self.app.open_ticket("T-1", "Alice", "A", opened_at=10)
+        self.app.receive("T-1", "q1", 15)
+        self.app.respond("T-1", "a1", 18)
+        self.app.receive("T-1", "q2", 20)
+        queue = self.app.customer_response_target_queue(50)
+        self.assertEqual(set(queue), {"as_of", "items"})
+        self.assertEqual(queue["as_of"], 50)
+        only = queue["items"][0]
+        self.assertEqual(set(only), {"ticket", "count", "waiting_minutes", "due_at", "overdue"})
+        # the minute-15 follow-up is covered; waiting and due start at the minute-20 one
+        self.assertEqual((only["count"], only["waiting_minutes"], only["due_at"], only["overdue"]),
+                         (1, 30, 50, False))
+        self.assertEqual(only["ticket"], self.app.get("T-1"))
+        # a wait strictly greater than the normal target (30) is overdue
+        self.assertEqual(self.app.customer_response_target_queue(51)["items"][0]["overdue"], True)
+
+    def test_customer_response_target_queue_same_minute_and_reply_boundary(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        self.app.receive("T", "q", 20)
+        self.app.respond("T", "a", 20)  # same minute already covers
+        self.assertEqual(self.app.customer_response_target_queue(100)["items"], [])
+        self.app.receive("T", "q2", 25)
+        self.app.receive("T", "q2b", 25)  # duplicate minute, counted separately
+        items = self.app.customer_response_target_queue(100)["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual((items[0]["count"], items[0]["waiting_minutes"]), (2, 75))
+        self.app.reply("T", "a2", 25)  # a reply in the same minute covers both
+        self.assertEqual(self.app.customer_response_target_queue(100)["items"], [])
+        self.app.receive("T", "q3", 26)
+        items = self.app.customer_response_target_queue(100)["items"]
+        self.assertEqual((items[0]["count"], items[0]["waiting_minutes"]), (1, 74))
+
+    def test_customer_response_target_queue_no_answers_empty_object_and_missing_histories(self):
+        # with no answer at all every follow-up stays unanswered
+        self.app.open_ticket("T-none", "Alice", "A", opened_at=0)
+        self.app.receive("T-none", "q1", 5)
+        self.app.receive("T-none", "q2", 5)
+        items = self.app.customer_response_target_queue(20)["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual((items[0]["count"], items[0]["waiting_minutes"], items[0]["due_at"]),
+                         (2, 15, 35))
+        # an empty-object first response counts as no answer; missing replies count as empty
+        self.app.open_ticket("T-empty", "Bob", "B", opened_at=0)
+        self.app.receive("T-empty", "q", 10)
+        data = self.app._read()
+        data["tickets"]["T-empty"]["first_response"] = {}
+        self.app._write(data)
+        items = self.app.customer_response_target_queue(40)["items"]
+        empty = [item for item in items if item["ticket"]["ticket_id"] == "T-empty"]
+        self.assertEqual((empty[0]["waiting_minutes"], empty[0]["due_at"]), (30, 40))
+        # a legacy ticket without opened_at but with a hand-written history still participates
+        self.app.open_ticket("T-legacy", "Cara", "C")
+        data = self.app._read()
+        data["tickets"]["T-legacy"]["customer_messages"] = [{"message": "q", "received_at": 10}]
+        self.app._write(data)
+        items = self.app.customer_response_target_queue(40)["items"]
+        legacy = [item for item in items if item["ticket"]["ticket_id"] == "T-legacy"]
+        self.assertEqual(legacy[0]["waiting_minutes"], 30)
+
+    def test_customer_response_target_queue_unassigned_ticket_is_included(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        self.app.receive("T", "q", 10)
+        items = self.app.customer_response_target_queue(40)["items"]
+        self.assertEqual(len(items), 1)
+        self.assertIsNone(items[0]["ticket"]["assignee"])
+
+    def test_customer_response_target_queue_service_periods_match_worked_example(self):
+        periods = [[10, 20], [30, 50]]
+        self.app.open_ticket("T-wait", "Alice", "A", opened_at=0)
+        self.app.receive("T-wait", "q", 15)
+        queue40 = self.app.customer_response_target_queue(40, {"normal": 15}, service_periods=periods)
+        only = queue40["items"][0]
+        # 15..19 (5) + 30..39 (10) = 15 covered minutes; the target is first reached at 40
+        self.assertEqual((only["waiting_minutes"], only["due_at"], only["overdue"]), (15, 40, False))
+        queue41 = self.app.customer_response_target_queue(41, {"normal": 15}, service_periods=periods)
+        self.assertEqual((queue41["items"][0]["waiting_minutes"], queue41["items"][0]["overdue"]),
+                         (16, True))
+        # due_at is simulated from periods after as_of: querying at 20 keeps due 40
+        queue20 = self.app.customer_response_target_queue(20, {"normal": 15}, service_periods=periods)
+        self.assertEqual((queue20["items"][0]["waiting_minutes"], queue20["items"][0]["due_at"]),
+                         (5, 40))
+
+    def test_customer_response_target_queue_empty_periods_and_insufficient_coverage(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        self.app.receive("T", "q", 15)
+        queue = self.app.customer_response_target_queue(100, service_periods=[])
+        self.assertEqual([(item["waiting_minutes"], item["due_at"], item["overdue"])
+                          for item in queue["items"]], [(0, None, False)])
+        # coverage from 15 with these periods is [20,40) = 20 minutes, short of target 31
+        queue = self.app.customer_response_target_queue(100, {"normal": 31},
+                                                        service_periods=[[0, 10], [20, 40]])
+        self.assertEqual([(item["waiting_minutes"], item["due_at"], item["overdue"])
+                          for item in queue["items"]], [(20, None, False)])
+
+    def test_customer_response_target_queue_merges_periods(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        self.app.receive("T", "q", 0)
+        for periods in ([[0, 6], [5, 10]], [[5, 10], [0, 5]], [[0, 10], [0, 6], [2, 4]]):
+            queue = self.app.customer_response_target_queue(10, {"normal": 10}, service_periods=periods)
+            self.assertEqual((queue["items"][0]["waiting_minutes"], queue["items"][0]["due_at"],
+                              queue["items"][0]["overdue"]), (10, 10, False), periods)
+
+    def test_customer_response_target_queue_priority_targets_and_sorting(self):
+        def pending(ticket_id, priority, received_at):
+            self.app.open_ticket(ticket_id, "Alice", "A", opened_at=0)
+            self.app.set_priority(ticket_id, priority)
+            self.app.receive(ticket_id, "q", received_at)
+        pending("u", "urgent", 90)   # due 95, waiting 10, overdue at 100
+        pending("h", "high", 90)     # due 105, not overdue
+        pending("n", "normal", 50)   # due 80, waiting 50, overdue
+        pending("l", "low", 0)       # due 60, waiting 100, overdue
+        queue = self.app.customer_response_target_queue(100)
+        self.assertEqual([item["ticket"]["ticket_id"] for item in queue["items"]],
+                         ["u", "n", "l", "h"])
+        # missing priority behaves as normal without backfilling the field
+        pending("m", "normal", 50)
+        data = self.app._read()
+        data["tickets"]["m"].pop("priority", None)
+        self.app._write(data)
+        queue = self.app.customer_response_target_queue(100)
+        self.assertNotIn("priority", self.app.get("m"))
+        self.assertIn("m", [item["ticket"]["ticket_id"] for item in queue["items"]])
+
+    def test_customer_response_target_queue_null_due_sorts_last_then_case_sensitive_id(self):
+        other = SupportDesk(self.root / "sort")
+        other.open_ticket("A", "Alice", "A", opened_at=0)
+        other.receive("A", "q", 0)
+        other.open_ticket("B", "Bob", "B", opened_at=0)
+        other.receive("B", "q", 30)
+        queue = other.customer_response_target_queue(30, {"normal": 15},
+                                                     service_periods=[[0, 10], [20, 40]])
+        # A reaches 15 covered minutes at 25; B (received 30) never accumulates the target
+        self.assertEqual([(item["ticket"]["ticket_id"], item["due_at"]) for item in queue["items"]],
+                         [("A", 25), ("B", None)])
+        other.open_ticket("t-a", "Cara", "C", opened_at=0)
+        other.receive("t-a", "q", 0)
+        other.open_ticket("T-b", "Dan", "D", opened_at=0)
+        other.receive("T-b", "q", 0)
+        queue = other.customer_response_target_queue(100)
+        tied = [item["ticket"]["ticket_id"] for item in queue["items"]
+                if item["ticket"]["ticket_id"] in ("t-a", "T-b")]
+        self.assertEqual(tied, ["T-b", "t-a"])
+
+    def test_customer_response_target_queue_closed_ticket_leaves_and_reopen_rejoins(self):
+        self.app.open_ticket("T-c", "Alice", "A", opened_at=0)
+        self.app.assign("T-c", "Bob")
+        self.app.receive("T-c", "q", 200)
+        self.app.close("T-c", "done")
+        self.assertEqual(self.app.customer_response_target_queue(100)["items"], [])
+        self.app.reopen_ticket("T-c", "again")
+        items = self.app.customer_response_target_queue(300)["items"]
+        self.assertEqual([item["ticket"]["ticket_id"] for item in items], ["T-c"])
+
+    def test_customer_response_target_queue_rejects_future_times_even_covered_or_empty_periods(self):
+        self.app.open_ticket("T-covered", "Alice", "A", opened_at=0)
+        self.app.receive("T-covered", "q", 5)
+        self.app.respond("T-covered", "a", 5)  # covered in the same minute
+        for kwargs in ({}, {"service_periods": []}):
+            with self.assertRaises(ValueError, msg=kwargs):
+                self.app.customer_response_target_queue(4, **kwargs)
+        self.app.open_ticket("T-reply", "Bob", "B", opened_at=0)
+        self.app.receive("T-reply", "q", 5)
+        self.app.respond("T-reply", "a", 5)
+        self.app.receive("T-reply", "q2", 6)
+        self.app.reply("T-reply", "a2", 60)  # future reply
+        with self.assertRaises(ValueError):
+            self.app.customer_response_target_queue(50)
+
+    def test_customer_response_target_queue_excluded_tickets_skip_future_time_checks(self):
+        # a closed ticket with a future follow-up never invalidates the query
+        self.app.open_ticket("T-closed", "Alice", "A", opened_at=0)
+        self.app.assign("T-closed", "Bob")
+        self.app.receive("T-closed", "q", 200)
+        self.app.close("T-closed", "done")
+        # an open ticket without a follow-up history is exempt too
+        self.app.open_ticket("T-history", "Bob", "B", opened_at=200)
+        queue = self.app.customer_response_target_queue(100, service_periods=[])
+        self.assertEqual(queue, {"as_of": 100, "items": []})
+
+    def test_customer_response_target_queue_rejects_bad_arguments_without_writing(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        self.app.receive("T", "q", 0)
+        before = self.app.path.read_bytes()
+        for as_of in (-1, True, 1.5, "100", None):
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.customer_response_target_queue(as_of)
+        for targets in ([], "x", 5, True, {"critical": 10}, {"normal": 0},
+                        {"normal": -1}, {"normal": True}, {"normal": 30.0},
+                        {"normal": "30"}, {"normal": None}):
+            with self.assertRaises(ValueError, msg=targets):
+                self.app.customer_response_target_queue(100, targets)
+        for periods in ({}, "x", 5, True, False, [[0, 10], "x"], [[0]], [[0, 10, 20]],
+                        [[True, 10]], [[0, False]], [[0.0, 10]], [[0, 10.0]],
+                        [[None, 10]], [[0, "10"]], [[-1, 10]], [[10, 10]], [[20, 10]]):
+            with self.assertRaises(ValueError, msg=periods):
+                self.app.customer_response_target_queue(100, service_periods=periods)
+        with self.assertRaises(TypeError):
+            self.app.customer_response_target_queue()
+        with self.assertRaises(TypeError):
+            self.app.customer_response_target_queue(100, {}, extra=1)
+        # parameters are validated even with no data
+        with self.assertRaises(ValueError):
+            SupportDesk(self.root / "empty").customer_response_target_queue(
+                -1, service_periods=[[-1, 5]])
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_customer_response_target_queue_empty_data_and_missing_directory_create_nothing(self):
+        self.assertEqual(self.app.customer_response_target_queue(7), {"as_of": 7, "items": []})
+        self.assertFalse(self.app.path.exists())
+        missing = self.root / "missing"
+        self.assertEqual(SupportDesk(missing).customer_response_target_queue(0, {}),
+                         {"as_of": 0, "items": []})
+        self.assertFalse(missing.exists())
+
+    def test_customer_response_target_queue_is_read_only_and_does_not_backfill(self):
+        self.app.open_ticket("T", "Alice", "A", opened_at=0)
+        self.app.receive("T", "q", 0)
+        before = self.app.path.read_bytes()
+        self.app.customer_response_target_queue(100, service_periods=[[0, 200]])
+        self.app.customer_response_target_queue(0)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertNotIn("priority", self.app.get("T"))
+        recreated = SupportDesk(self.root).customer_response_target_queue(100)
+        self.assertEqual(recreated["items"][0]["ticket"], self.app.get("T"))
+
+    def test_cli_customer_response_target_queue(self):
+        periods = [[10, 20], [30, 50]]
+        self.app.open_ticket("T-wait", "Alice", "A", opened_at=0)
+        self.app.receive("T-wait", "q", 15)
+        payload = self.root / "queue.json"
+        payload.write_text(json.dumps({"as_of": 41, "targets": {"normal": 15},
+                                       "service_periods": periods}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "customer-response-target-queue", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(set(value), {"as_of", "items"})
+        self.assertEqual([(i["ticket"]["ticket_id"], i["count"], i["waiting_minutes"],
+                           i["due_at"], i["overdue"]) for i in value["items"]],
+                         [("T-wait", 1, 16, 40, True)])
+        # an array runs each object independently and returns an array of results
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"as_of": 40, "targets": {"normal": 15}, "service_periods": periods},
+            {"as_of": 41, "targets": {"normal": 15}, "service_periods": periods},
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "customer-response-target-queue", str(batch)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        queues = json.loads(result.stdout)
+        self.assertEqual([q["items"][0]["overdue"] for q in queues], [False, True])
+        # bad arguments fail through the shared envelope with exit code 2
+        bad = self.root / "bad.json"
+        for body in ({"as_of": -1}, {"as_of": 100, "service_periods": [[20, 10]]},
+                     {}, {"as_of": 100, "extra": 1}):
+            bad.write_text(json.dumps(body), encoding="utf-8")
+            failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root), "customer-response-target-queue", str(bad)], text=True, capture_output=True)
+            self.assertEqual(failed.returncode, 2, body)
+            self.assertIn("error", json.loads(failed.stderr))
+            self.assertEqual(failed.stdout, "")
+
+    def test_cli_customer_response_target_queue_missing_directory_creates_nothing(self):
+        missing = self.root / "missing"
+        payload = self.root / "queue.json"
+        payload.write_text(json.dumps({"as_of": 0}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(missing), "customer-response-target-queue", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"as_of": 0, "items": []})
+        self.assertFalse(missing.exists())
+
     def test_set_knowledge_enabled_persists_and_repeat_is_quiet(self):
         self._closed_ticket()
         entry = self.app.publish_knowledge("KB-1", "T")
