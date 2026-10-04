@@ -949,10 +949,12 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
-    def reply_many(self, items):
-        # Append follow-up replies for an explicitly selected set of tickets in
-        # one atomic batch: every reply is saved together, or validation leaves
-        # every ticket, the store directory and the data file untouched.
+    @staticmethod
+    def _normalize_reply_items(items):
+        # The item shape shared by reply_many and reply_many_once: a nonempty
+        # array of objects, each naming one ticket exactly once with a replied_at
+        # minute and exactly one of a handwritten message or a knowledge
+        # reference (revision only alongside article_id).
         if not isinstance(items, list) or not items:
             raise ValueError("items must be a nonempty array")
         allowed = {"ticket_id", "replied_at", "message", "article_id", "revision"}
@@ -981,13 +983,14 @@ class SupportDesk(JsonStore):
                 raw_revision = item.get("revision")
                 revision = None if raw_revision is None else positive(raw_revision, "revision")
                 normalized.append((ticket_id, replied_at, ("knowledge", article_id, revision)))
-        data = self._read()
-        tickets = data.get("tickets", {})
-        targets = []
+        return normalized
+
+    def _append_reply_records(self, data, normalized):
         # Resolve and validate every selected ticket, time and knowledge
         # reference before mutating anything, so a rejected batch writes no
         # directory or file and leaves no partial reply (e.g. a disabled article
         # on the last item keeps every earlier ticket unchanged).
+        targets = []
         for ticket_id, replied_at, choice in normalized:
             ticket = self._reply_target(data, ticket_id)
             if choice[0] == "manual":
@@ -1008,8 +1011,60 @@ class SupportDesk(JsonStore):
         for ticket, record in targets:
             ticket.setdefault("replies", []).append(record)
             replied.append(ticket)
+        return replied
+
+    def reply_many(self, items):
+        # Append follow-up replies for an explicitly selected set of tickets in
+        # one atomic batch: every reply is saved together, or validation leaves
+        # every ticket, the store directory and the data file untouched.
+        normalized = self._normalize_reply_items(items)
+        data = self._read()
+        replied = self._append_reply_records(data, normalized)
         self._write(data)
         return replied
+
+    @staticmethod
+    def _canonical_reply_items(normalized):
+        # The dedup fingerprint of a normalized batch: ticket order, reply kind,
+        # body or article id, revision and time all take part; an omitted or null
+        # revision is already folded to None, so both compare equal while an
+        # explicit revision stays distinct. Key order inside each entry never
+        # matters because entries compare as mappings.
+        canonical = []
+        for ticket_id, replied_at, choice in normalized:
+            if choice[0] == "manual":
+                canonical.append({"ticket_id": ticket_id, "replied_at": replied_at,
+                                  "kind": "manual", "message": choice[1]})
+            else:
+                canonical.append({"ticket_id": ticket_id, "replied_at": replied_at,
+                                  "kind": "knowledge", "article_id": choice[1],
+                                  "revision": choice[2]})
+        return canonical
+
+    def reply_many_once(self, request_id, items):
+        # Idempotent variant of reply_many: the same normalized batch under the
+        # same request id is applied at most once per root. The association lives
+        # in root/data.json under reply_many_requests, outside tickets and reply
+        # records, and shares no identifiers with receive_once.
+        request_id = text(request_id, "request_id")
+        normalized = self._normalize_reply_items(items)
+        canonical = self._canonical_reply_items(normalized)
+        data = self._read()
+        registered = data.get("reply_many_requests", {}).get(request_id)
+        if registered is not None:
+            # A matching retry writes nothing and returns the current tickets in
+            # the original input order, even after later replies, closure,
+            # reopening or knowledge changes; the stored snapshot is never
+            # refreshed. A changed batch (including reordered items) is rejected.
+            if registered["items"] != canonical:
+                raise ValueError("request_id was already registered with a different batch")
+            tickets = data.get("tickets", {})
+            return {"tickets": [tickets[ticket_id] for ticket_id, _, _ in normalized],
+                    "created": False}
+        replied = self._append_reply_records(data, normalized)
+        data.setdefault("reply_many_requests", {})[request_id] = {"items": canonical}
+        self._write(data)
+        return {"tickets": replied, "created": True}
 
     def receive(self, ticket_id, message, received_at):
         ticket_id, message = text(ticket_id, "ticket_id"), text(message, "message")

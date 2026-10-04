@@ -4864,6 +4864,245 @@ class ProductTests(unittest.TestCase):
         self.assertIn("error", json.loads(failed.stderr))
         self.assertEqual([m["received_at"] for m in self.app.get("T")["customer_messages"]], [5, 6])
 
+    def _answered_ticket(self, ticket_id, opened_at=0, responded_at=5):
+        self.app.open_ticket(ticket_id, "Alice", "S-" + ticket_id, opened_at=opened_at)
+        self.app.respond(ticket_id, "first", responded_at)
+        return ticket_id
+
+    def _published_article(self, article_id="A1", resolution="固定答复"):
+        self.app.open_ticket("K-" + article_id, "Bob", "标题-" + article_id, opened_at=0)
+        self.app.assign("K-" + article_id, "Eve")
+        self.app.close("K-" + article_id, resolution, closed_at=1)
+        return self.app.publish_knowledge(article_id, "K-" + article_id)
+
+    def test_reply_many_once_registers_and_persists_association(self):
+        self._answered_ticket("T-1")
+        self._answered_ticket("T-2")
+        self._published_article()
+        items = [{"ticket_id": " T-1 ", "message": "  好的\n马上  ", "replied_at": 10},
+                 {"ticket_id": "T-2", "article_id": " A1 ", "replied_at": 11}]
+        result = self.app.reply_many_once(" req-1 ", items)
+        self.assertEqual(set(result), {"tickets", "created"})
+        self.assertTrue(result["created"])
+        self.assertEqual([t["ticket_id"] for t in result["tickets"]], ["T-1", "T-2"])
+        self.assertEqual(result["tickets"][0]["replies"],
+                         [{"message": "好的\n马上", "replied_at": 10}])
+        knowledge_reply = result["tickets"][1]["replies"][0]
+        self.assertEqual(knowledge_reply["message"], "固定答复")
+        self.assertEqual(knowledge_reply["knowledge"]["article_id"], "A1")
+        self.assertNotIn("knowledge_revision", knowledge_reply)
+        # the association lives at root level, not inside tickets or reply records
+        self.assertNotIn("reply_many_requests", result["tickets"][0])
+        self.assertNotIn("request_id", knowledge_reply)
+        data = self.app._read()
+        self.assertIn("req-1", data["reply_many_requests"])
+        reloaded = SupportDesk(self.root)
+        retry = reloaded.reply_many_once("req-1", [
+            {"replied_at": 10, "message": "好的\n马上", "ticket_id": "T-1"},
+            {"ticket_id": "T-2", "article_id": "A1", "replied_at": 11, "revision": None},
+        ])
+        self.assertFalse(retry["created"])
+        self.assertEqual(retry["tickets"], [reloaded.get("T-1"), reloaded.get("T-2")])
+        self.assertEqual(len(reloaded.get("T-1")["replies"]), 1)
+        self.assertEqual(len(reloaded.get("T-2")["replies"]), 1)
+
+    def test_reply_many_once_retry_does_not_write_even_as_state_changes(self):
+        self._answered_ticket("T-1")
+        self._answered_ticket("T-2")
+        self._published_article()
+        items = [{"ticket_id": "T-1", "message": "m1", "replied_at": 10},
+                 {"ticket_id": "T-2", "article_id": "A1", "replied_at": 10}]
+        self.assertTrue(self.app.reply_many_once("r1", items)["created"])
+        # later replies, closure, reopening, knowledge revision and disabling
+        self.app.reply("T-1", "later", 20)
+        self.app.reply("T-2", "later", 20)
+        self.app.assign("T-1", "Eve")
+        self.app.close("T-1", "done", closed_at=30)
+        self.app.reopen_ticket("T-1", "again")
+        self.app.update_knowledge("A1", "标题-A1", "新内容")
+        self.app.set_knowledge_enabled("A1", False)
+        before = self.app.path.read_bytes()
+        result = self.app.reply_many_once("r1", items)
+        self.assertFalse(result["created"])
+        self.assertEqual([t["ticket_id"] for t in result["tickets"]], ["T-1", "T-2"])
+        self.assertEqual(result["tickets"], [self.app.get("T-1"), self.app.get("T-2")])
+        # the original snapshot is kept; nothing is revalidated or rewritten
+        self.assertEqual(result["tickets"][1]["replies"][0]["message"], "固定答复")
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_reply_many_once_same_id_different_batch_is_rejected(self):
+        self._answered_ticket("T-1")
+        self._answered_ticket("T-2")
+        self._published_article()
+        items = [{"ticket_id": "T-1", "message": "m1", "replied_at": 10},
+                 {"ticket_id": "T-2", "article_id": "A1", "replied_at": 10}]
+        self.app.reply_many_once("r1", items)
+        before = self.app.path.read_bytes()
+        changed = [
+            # changed body
+            [{"ticket_id": "T-1", "message": "other", "replied_at": 10},
+             {"ticket_id": "T-2", "article_id": "A1", "replied_at": 10}],
+            # changed time
+            [{"ticket_id": "T-1", "message": "m1", "replied_at": 11},
+             {"ticket_id": "T-2", "article_id": "A1", "replied_at": 10}],
+            # changed kind
+            [{"ticket_id": "T-1", "article_id": "A1", "replied_at": 10},
+             {"ticket_id": "T-2", "article_id": "A1", "replied_at": 10}],
+            # explicit revision is not the omitted one
+            [{"ticket_id": "T-1", "message": "m1", "replied_at": 10},
+             {"ticket_id": "T-2", "article_id": "A1", "replied_at": 10, "revision": 1}],
+            # reordered items
+            [{"ticket_id": "T-2", "article_id": "A1", "replied_at": 10},
+             {"ticket_id": "T-1", "message": "m1", "replied_at": 10}],
+        ]
+        for batch in changed:
+            with self.assertRaises(ValueError, msg=batch):
+                self.app.reply_many_once("r1", batch)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # omitted and null revision are equivalent and still match
+        retry = self.app.reply_many_once("r1", [
+            {"ticket_id": "T-1", "message": "m1", "replied_at": 10},
+            {"ticket_id": "T-2", "article_id": "A1", "replied_at": 10, "revision": None},
+        ])
+        self.assertFalse(retry["created"])
+
+    def test_reply_many_once_distinct_ids_and_roots_are_independent(self):
+        self._answered_ticket("T-1")
+        self._answered_ticket("T-2")
+        items = [{"ticket_id": "T-1", "message": "m", "replied_at": 10},
+                 {"ticket_id": "T-2", "message": "m", "replied_at": 10}]
+        self.assertTrue(self.app.reply_many_once("r1", items)["created"])
+        # a different id with identical content is a new batch
+        self.assertTrue(self.app.reply_many_once("r2", items)["created"])
+        self.assertEqual(len(self.app.get("T-1")["replies"]), 2)
+        # receive_once lives in its own namespace
+        self.app.receive("T-1", "q", 10)
+        self.assertTrue(self.app.receive_once("T-1", "q2", 11, "r1")["created"])
+        # another root does not dedup against this one
+        other_root = self.root / "other"
+        other = SupportDesk(other_root)
+        other.open_ticket("T-1", "Alice", "S", opened_at=0)
+        other.respond("T-1", "first", 5)
+        other.open_ticket("T-2", "Alice", "S", opened_at=0)
+        other.respond("T-2", "first", 5)
+        self.assertTrue(other.reply_many_once("r1", items)["created"])
+
+    def test_reply_many_once_rejects_bad_input_without_writing_or_reserving_id(self):
+        self._answered_ticket("T-1")
+        self._answered_ticket("T-2")
+        self._published_article()
+        self.app.reply_many_once("r0", [{"ticket_id": "T-1", "message": "ok", "replied_at": 10}])
+        before = self.app.path.read_bytes()
+        for request_id in (None, 1, " ", True):
+            with self.assertRaises(ValueError, msg=request_id):
+                self.app.reply_many_once(request_id, [{"ticket_id": "T-1", "message": "m", "replied_at": 10}])
+        bad_batches = [
+            None, "x", [], 1,
+            [{"ticket_id": "T-1", "replied_at": 10}],
+            [{"ticket_id": "T-1", "replied_at": 10, "message": "m", "article_id": "A1"}],
+            [{"ticket_id": "T-1", "replied_at": 10, "message": "m", "revision": 1}],
+            [{"ticket_id": "T-1", "replied_at": 10, "message": "m", "extra": 1}],
+            [{"ticket_id": " ", "replied_at": 10, "message": "m"}],
+            [{"ticket_id": "T-1", "replied_at": 10, "message": " "}],
+            [{"ticket_id": "T-1", "replied_at": -1, "message": "m"}],
+            [{"ticket_id": "T-1", "replied_at": True, "message": "m"}],
+            [{"ticket_id": "T-1", "replied_at": 10, "article_id": "A1", "revision": 0}],
+            [{"ticket_id": "T-1", "replied_at": 10, "message": "m"},
+             {"ticket_id": "T-1", "replied_at": 11, "message": "n"}],
+            # business conditions: unknown ticket, unknown article, time regression
+            [{"ticket_id": "missing", "replied_at": 10, "message": "m"}],
+            [{"ticket_id": "T-1", "replied_at": 10, "article_id": "missing"}],
+            [{"ticket_id": "T-1", "replied_at": 4, "message": "m"}],
+            [{"ticket_id": "T-1", "replied_at": 10, "message": "m"},
+             {"ticket_id": "T-2", "replied_at": 10, "article_id": "missing"}],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(ValueError, msg=batch):
+                self.app.reply_many_once("r1", batch)
+        with self.assertRaises(TypeError):
+            self.app.reply_many_once("r1")
+        with self.assertRaises(TypeError):
+            self.app.reply_many_once([{"ticket_id": "T-1", "message": "m", "replied_at": 10}])
+        with self.assertRaises(TypeError):
+            self.app.reply_many_once("r1", [{"ticket_id": "T-1", "message": "m", "replied_at": 10}], "extra")
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertNotIn("reply_many_requests", self.app._read().get("tickets", {}).get("T-1", {}))
+        # rejected ids were never reserved; the fixed batch may reuse them
+        result = self.app.reply_many_once("r1", [{"ticket_id": "T-2", "message": "fixed", "replied_at": 10}])
+        self.assertTrue(result["created"])
+        self.assertEqual([r["message"] for r in self.app.get("T-1")["replies"]], ["ok"])
+
+    def test_reply_many_once_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.reply_many_once("r1", [{"ticket_id": "T", "message": "m", "replied_at": 1}])
+        self.assertFalse(fresh.exists())
+
+    def test_reply_many_once_replies_join_conversation_search_and_stats(self):
+        self._answered_ticket("T-1")
+        self._published_article()
+        self.app.reply_many_once("r1", [
+            {"ticket_id": "T-1", "article_id": "A1", "replied_at": 10},
+        ])
+        conversation = self.app.conversation("T-1")
+        self.assertEqual([e["kind"] for e in conversation["items"]], ["first_response", "reply"])
+        found = self.app.search_tickets("固定答复")
+        self.assertIn("T-1", [t["ticket_id"] for t in found["items"]])
+        usage = self.app.knowledge_usage_report()
+        self.assertEqual(usage[0]["replies"], 1)
+        self.assertEqual(usage[0]["last_used_at"], 10)
+        queue = self.app.follow_up_queue(100)
+        self.assertEqual(queue["items"][0]["last_answered_at"], 10)
+
+    def test_cli_reply_many_once_object_and_array_semantics(self):
+        self._answered_ticket("T-1")
+        self._answered_ticket("T-2")
+        payload = self.root / "once.json"
+        payload.write_text(json.dumps({
+            "request_id": "r1",
+            "items": [{"ticket_id": "T-1", "message": "m1", "replied_at": 10},
+                      {"ticket_id": "T-2", "message": "m2", "replied_at": 10}],
+        }), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-m", "support_desk", "--root", str(self.root),
+             "reply-many-once", str(payload)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(set(value), {"tickets", "created"})
+        self.assertTrue(value["created"])
+        self.assertEqual([t["ticket_id"] for t in value["tickets"]], ["T-1", "T-2"])
+        # identical retry: created false, no new replies
+        retry = subprocess.run(
+            [sys.executable, "-m", "support_desk", "--root", str(self.root),
+             "reply-many-once", str(payload)], text=True, capture_output=True)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertFalse(json.loads(retry.stdout)["created"])
+        self.assertEqual(len(self.app.get("T-1")["replies"]), 1)
+        # array: earlier success survives a later failing item
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"request_id": "r2", "items": [{"ticket_id": "T-1", "message": "m3", "replied_at": 11}]},
+            {"request_id": "r3", "items": [{"ticket_id": "missing", "message": "m4", "replied_at": 11}]},
+        ]), encoding="utf-8")
+        failed = subprocess.run(
+            [sys.executable, "-m", "support_desk", "--root", str(self.root),
+             "reply-many-once", str(batch)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertEqual([r["message"] for r in self.app.get("T-1")["replies"]], ["m1", "m3"])
+        # the failed id was not reserved
+        fixed = self.root / "fixed.json"
+        fixed.write_text(json.dumps(
+            {"request_id": "r3", "items": [{"ticket_id": "T-2", "message": "m4", "replied_at": 11}]}),
+            encoding="utf-8")
+        ok = subprocess.run(
+            [sys.executable, "-m", "support_desk", "--root", str(self.root),
+             "reply-many-once", str(fixed)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertTrue(json.loads(ok.stdout)["created"])
+
     def test_customer_queue_counts_waiting_and_overdue_boundary(self):
         self._received_ticket("T", 0)
         self.app.respond("T", "answer", 10)
