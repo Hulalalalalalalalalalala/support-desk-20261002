@@ -145,6 +145,125 @@ def _route_coverage(candidates, rule_by_category, loads, limits):
     return choices
 
 
+def _boolean_ast(query):
+    # Tokenize: plain words end at whitespace, parentheses or double quotes;
+    # every other character (including backslash and lowercase and/or/not) is
+    # part of the word and matches literally. Only the exact uppercase words
+    # AND, OR and NOT are operators.
+    tokens = []
+    index = 0
+    while index < len(query):
+        char = query[index]
+        if char.isspace():
+            index += 1
+        elif char in "()":
+            tokens.append((char, char))
+            index += 1
+        elif char == '"':
+            index += 1
+            chars = []
+            while index < len(query) and query[index] != '"':
+                if query[index] == "\\":
+                    # Inside a phrase a backslash escapes only a double quote or
+                    # another backslash; anything else (or a trailing backslash)
+                    # is rejected.
+                    if index + 1 >= len(query):
+                        raise ValueError("query has a dangling escape in a phrase")
+                    escaped = query[index + 1]
+                    if escaped not in ('"', "\\"):
+                        raise ValueError("query has an invalid escape in a phrase")
+                    chars.append(escaped)
+                    index += 2
+                else:
+                    chars.append(query[index])
+                    index += 1
+            if index >= len(query):
+                raise ValueError("query has an unterminated phrase")
+            index += 1
+            phrase = "".join(chars)
+            if not phrase.strip():
+                raise ValueError("query phrase must be nonempty")
+            tokens.append(("term", phrase))
+        else:
+            start = index
+            while index < len(query) and not query[index].isspace() \
+                    and query[index] not in '()"':
+                index += 1
+            word = query[start:index]
+            if word in ("AND", "OR", "NOT"):
+                tokens.append((word, word))
+            else:
+                tokens.append(("term", word))
+    # Parse with precedence NOT, then AND, then OR; parentheses nest freely and
+    # adjacent conditions always need an explicit AND or OR between them.
+    position = 0
+
+    def peek():
+        return tokens[position] if position < len(tokens) else None
+
+    def parse_or():
+        nonlocal position
+        node = parse_and()
+        while peek() is not None and peek()[0] == "OR":
+            position += 1
+            node = ("OR", node, parse_and())
+        return node
+
+    def parse_and():
+        nonlocal position
+        node = parse_not()
+        while peek() is not None and peek()[0] == "AND":
+            position += 1
+            node = ("AND", node, parse_not())
+        return node
+
+    def parse_not():
+        nonlocal position
+        if peek() is not None and peek()[0] == "NOT":
+            position += 1
+            return ("NOT", parse_not())
+        return parse_primary()
+
+    def parse_primary():
+        nonlocal position
+        token = peek()
+        if token is None:
+            raise ValueError("query is missing an operand")
+        if token[0] == "term":
+            position += 1
+            return ("term", token[1].casefold())
+        if token[0] == "(":
+            position += 1
+            node = parse_or()
+            if peek() is None or peek()[0] != ")":
+                raise ValueError("query has an unpaired parenthesis")
+            position += 1
+            return node
+        raise ValueError("query is missing an operand")
+
+    if not tokens:
+        raise ValueError("query must contain a condition")
+    node = parse_or()
+    if position < len(tokens):
+        if tokens[position][0] == ")":
+            raise ValueError("query has an unpaired parenthesis")
+        raise ValueError("query is missing a connector between conditions")
+    return node
+
+
+def _boolean_matches(node, haystacks):
+    # A term is a contiguous substring of one record; different terms may hit
+    # different records of the same ticket, but a term never spans records.
+    kind = node[0]
+    if kind == "term":
+        return any(node[1] in haystack for haystack in haystacks)
+    if kind == "AND":
+        return _boolean_matches(node[1], haystacks) and _boolean_matches(node[2], haystacks)
+    if kind == "OR":
+        return _boolean_matches(node[1], haystacks) or _boolean_matches(node[2], haystacks)
+    return not _boolean_matches(node[1], haystacks)
+
+
 def _service_periods(service_periods):
     if service_periods is None:
         return None
@@ -2005,9 +2124,11 @@ class SupportDesk(JsonStore):
             matches = (t for t in tickets if t.get("category") == category)
         return sorted((t for t in matches if status is None or t["status"] == status), key=lambda t: t["ticket_id"])
 
-    def search_tickets(self, query, status=None, category=_UNSET, offset=0, limit=20):
+    def search_tickets(self, query, status=None, category=_UNSET, offset=0, limit=20, *, query_mode="plain"):
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a nonempty string")
+        if query_mode not in ("plain", "boolean"):
+            raise ValueError("query_mode must be plain or boolean")
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")
         if category is not _UNSET and category is not None:
@@ -2017,7 +2138,17 @@ class SupportDesk(JsonStore):
             raise ValueError("offset must be a nonnegative integer")
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
-        terms = [term.casefold() for term in query.strip().split()]
+        if query_mode == "plain":
+            terms = [term.casefold() for term in query.strip().split()]
+
+            def predicate(haystacks):
+                return all(any(term in haystack for haystack in haystacks) for term in terms)
+        else:
+            # The query is fully parsed and validated even when there is no data.
+            ast = _boolean_ast(query)
+
+            def predicate(haystacks):
+                return _boolean_matches(ast, haystacks)
         matched = []
         for ticket in self._read().get("tickets", {}).values():
             if status is not None and ticket["status"] != status:
@@ -2041,7 +2172,7 @@ class SupportDesk(JsonStore):
                 if reply.get("message"):
                     fields.append(reply["message"])
             haystacks = [field.casefold() for field in fields]
-            if all(any(term in haystack for haystack in haystacks) for term in terms):
+            if predicate(haystacks):
                 matched.append(ticket)
         matched.sort(key=lambda ticket: ticket["ticket_id"])
         return {"total": len(matched), "items": matched[offset:offset + limit]}
