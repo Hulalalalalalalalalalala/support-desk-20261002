@@ -949,10 +949,12 @@ class SupportDesk(JsonStore):
         self._write(data)
         return ticket
 
-    def reply_many(self, items):
-        # Append follow-up replies for an explicitly selected set of tickets in
-        # one atomic batch: every reply is saved together, or validation leaves
-        # every ticket, the store directory and the data file untouched.
+    @staticmethod
+    def _normalize_reply_items(items):
+        # The item shape shared by reply_many and reply_many_once: each item
+        # carries ticket_id, replied_at and exactly one of message or
+        # article_id; revision may only accompany a knowledge reference, so any
+        # other key (or neither/both bodies) rejects the whole group.
         if not isinstance(items, list) or not items:
             raise ValueError("items must be a nonempty array")
         allowed = {"ticket_id", "replied_at", "message", "article_id", "revision"}
@@ -962,9 +964,6 @@ class SupportDesk(JsonStore):
             if not isinstance(item, dict) or not {"ticket_id", "replied_at"} <= set(item) \
                     or not set(item) <= allowed \
                     or ("message" in item) == ("article_id" in item):
-                # Exactly one of message and article_id must be present; revision
-                # may only accompany a knowledge reference, so any other key (or
-                # neither/both bodies) rejects the whole group.
                 raise ValueError("each item must contain ticket_id, replied_at and exactly one of message or article_id")
             ticket_id = text(item["ticket_id"], "ticket_id")
             replied_at = minute(item["replied_at"], "replied_at")
@@ -981,13 +980,14 @@ class SupportDesk(JsonStore):
                 raw_revision = item.get("revision")
                 revision = None if raw_revision is None else positive(raw_revision, "revision")
                 normalized.append((ticket_id, replied_at, ("knowledge", article_id, revision)))
-        data = self._read()
-        tickets = data.get("tickets", {})
-        targets = []
+        return normalized
+
+    def _reply_targets(self, data, normalized):
         # Resolve and validate every selected ticket, time and knowledge
         # reference before mutating anything, so a rejected batch writes no
         # directory or file and leaves no partial reply (e.g. a disabled article
         # on the last item keeps every earlier ticket unchanged).
+        targets = []
         for ticket_id, replied_at, choice in normalized:
             ticket = self._reply_target(data, ticket_id)
             if choice[0] == "manual":
@@ -1004,12 +1004,66 @@ class SupportDesk(JsonStore):
                 if chosen_revision is not None:
                     record["knowledge_revision"] = chosen_revision
             targets.append((ticket, record))
+        return targets
+
+    def reply_many(self, items):
+        # Append follow-up replies for an explicitly selected set of tickets in
+        # one atomic batch: every reply is saved together, or validation leaves
+        # every ticket, the store directory and the data file untouched.
+        normalized = self._normalize_reply_items(items)
+        data = self._read()
+        targets = self._reply_targets(data, normalized)
         replied = []
         for ticket, record in targets:
             ticket.setdefault("replies", []).append(record)
             replied.append(ticket)
         self._write(data)
         return replied
+
+    def reply_many_once(self, request_id, items):
+        # Idempotent variant of reply_many: the request id and the normalized
+        # batch are associated in root/data.json (outside tickets and reply
+        # records), so recreating SupportDesk still recognizes a retry. The id
+        # is unique per root within this feature and shares no namespace with
+        # receive_once.
+        request_id = text(request_id, "request_id")
+        normalized = self._normalize_reply_items(items)
+        # The dedup key is the normalized batch in input order: ticket order,
+        # reply kind, body or article id, revision and time all take part, while
+        # object key order does not; an omitted or null revision normalizes to
+        # the same null, and an explicit revision never equals an omitted one.
+        canonical = []
+        for ticket_id, replied_at, choice in normalized:
+            if choice[0] == "manual":
+                canonical.append({"ticket_id": ticket_id, "replied_at": replied_at,
+                                  "kind": "manual", "message": choice[1]})
+            else:
+                canonical.append({"ticket_id": ticket_id, "replied_at": replied_at,
+                                  "kind": "knowledge", "article_id": choice[1],
+                                  "revision": choice[2]})
+        data = self._read()
+        registered = data.get("reply_many_requests", {}).get(request_id)
+        if registered is not None:
+            # A matching retry appends nothing and writes nothing: it returns the
+            # current full tickets in the original input order, even after later
+            # replies, closure, reopening or knowledge revision, restore or
+            # disabling; submission conditions are never re-checked and no new
+            # content is fetched, so the original snapshots stay untouched. The
+            # same id with any other normalized batch (including another item
+            # order) is rejected.
+            if registered["items"] != canonical:
+                raise ValueError("request_id was already registered with a different batch")
+            tickets = data.get("tickets", {})
+            return {"tickets": [tickets[item["ticket_id"]] for item in registered["items"]],
+                    "created": False}
+        targets = self._reply_targets(data, normalized)
+        replied = []
+        for ticket, record in targets:
+            ticket.setdefault("replies", []).append(record)
+            replied.append(ticket)
+        data.setdefault("reply_many_requests", {})[request_id] = {"items": canonical}
+        self._write(data)
+        return {"tickets": replied, "created": True}
 
     def receive(self, ticket_id, message, received_at):
         ticket_id, message = text(ticket_id, "ticket_id"), text(message, "message")
