@@ -4659,6 +4659,271 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(failed.stdout, "")
         self.assertIn("error", json.loads(failed.stderr))
 
+    def _customer_target_groups(self, report):
+        return {group["priority"]: group for group in report["groups"]}
+
+    def _customer_target_scenario(self):
+        # urgent answered exactly on target (5); high answered one minute late (16 vs 15);
+        # two normal pending follow-ups (waits 30 equal and 31 over); one normal answered
+        # exactly on target (30); one low follow-up on a closed ticket without an answer.
+        self._received_ticket("T-urgent", 0)
+        self.app.set_priority("T-urgent", "urgent")
+        self.app.receive("T-urgent", "q", 0)
+        self.app.respond("T-urgent", "a", 5)
+        self._received_ticket("T-high", 0)
+        self.app.set_priority("T-high", "high")
+        self.app.receive("T-high", "q", 0)
+        self.app.respond("T-high", "a", 16)
+        self._received_ticket("T-eq", 0)
+        self.app.receive("T-eq", "q", 30)
+        self._received_ticket("T-over", 0)
+        self.app.receive("T-over", "q", 29)
+        self._received_ticket("T-old", 0)
+        self.app.receive("T-old", "q", 0)
+        self.app.respond("T-old", "a", 30)
+        self._received_ticket("T-low", 0)
+        self.app.set_priority("T-low", "low")
+        self.app.receive("T-low", "q", 0)
+        self.app.assign("T-low", "Eve")
+        self.app.close("T-low", "Done")
+
+    def test_customer_response_target_report_group_counts_order_and_defaults(self):
+        self._customer_target_scenario()
+        report = self.app.customer_response_target_report(60)
+        self.assertEqual(set(report), {"as_of", "groups"})
+        self.assertEqual(report["as_of"], 60)
+        self.assertEqual([g["priority"] for g in report["groups"]],
+                         ["urgent", "high", "normal", "low"])
+        self.assertEqual([g["target_minutes"] for g in report["groups"]], [5, 15, 30, 60])
+        groups = self._customer_target_groups(report)
+        for group in report["groups"]:
+            self.assertEqual(set(group),
+                             {"priority", "target_minutes", "total", "answered", "on_time",
+                              "late", "pending", "overdue", "closed_without_answer",
+                              "on_time_rate"})
+        urgent, high, normal, low = (groups[p] for p in ("urgent", "high", "normal", "low"))
+        self.assertEqual((urgent["total"], urgent["answered"], urgent["on_time"], urgent["late"],
+                          urgent["on_time_rate"]), (1, 1, 1, 0, 1.0))
+        self.assertEqual((high["answered"], high["on_time"], high["late"],
+                          high["on_time_rate"]), (1, 0, 1, 0.0))
+        # totals count follow-ups, not tickets; the two pending follow-ups wait 30 and 31
+        self.assertEqual((normal["total"], normal["answered"], normal["on_time"], normal["late"],
+                          normal["pending"], normal["overdue"], normal["closed_without_answer"],
+                          normal["on_time_rate"]), (3, 1, 1, 0, 2, 1, 0, 1.0))
+        self.assertEqual((low["total"], low["answered"], low["pending"], low["overdue"],
+                          low["closed_without_answer"], low["on_time_rate"]),
+                         (1, 0, 0, 0, 1, None))
+        # recreating SupportDesk gives the same report; read-only, no priority backfill
+        self.assertEqual(SupportDesk(self.root).customer_response_target_report(60), report)
+        self.assertNotIn("priority", self.app.get("T-old"))
+
+    def test_customer_response_target_report_boundaries_and_target_override(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q", 10)
+        self.app.respond("T", "a", 20)   # 10 natural minutes
+        groups = self._customer_target_groups(
+            self.app.customer_response_target_report(30, targets={"normal": 10}))
+        self.assertEqual((groups["normal"]["on_time"], groups["normal"]["late"]), (1, 0))
+        groups = self._customer_target_groups(
+            self.app.customer_response_target_report(30, targets={"normal": 9}))
+        self.assertEqual((groups["normal"]["on_time"], groups["normal"]["late"]), (0, 1))
+        # pending: wait equal to the target is not overdue, one minute more is
+        self._received_ticket("W", 0)
+        self.app.receive("W", "q", 20)
+        at30 = self._customer_target_groups(
+            self.app.customer_response_target_report(30, targets={"normal": 10}))["normal"]
+        self.assertEqual((at30["pending"], at30["overdue"]), (1, 0))
+        at31 = self._customer_target_groups(
+            self.app.customer_response_target_report(31, targets={"normal": 10}))["normal"]
+        self.assertEqual((at31["pending"], at31["overdue"]), (1, 1))
+        # omitted, null and empty targets all use the defaults
+        baseline = self.app.customer_response_target_report(30)
+        self.assertEqual(self.app.customer_response_target_report(30, targets=None), baseline)
+        self.assertEqual(self.app.customer_response_target_report(30, targets={}), baseline)
+
+    def test_customer_response_target_report_duplicates_one_answer_and_zero_minutes(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q", 10)
+        self.app.receive("T", "q", 10)   # duplicate follow-up, counted independently
+        self.app.respond("T", "a", 10)   # one answer covers both with zero minutes
+        groups = self._customer_target_groups(
+            self.app.customer_response_target_report(20, targets={"normal": 1}))
+        # elapsed 0 is not greater than even a one-minute target: both on time
+        self.assertEqual((groups["normal"]["total"], groups["normal"]["answered"],
+                          groups["normal"]["on_time"], groups["normal"]["late"]), (2, 2, 2, 0))
+
+    def test_customer_response_target_report_knowledge_answers_count_equally(self):
+        self._received_ticket("TS", 0)
+        self.app.assign("TS", "Eve")
+        self.app.close("TS", "Done")
+        self.app.publish_knowledge("K", "TS")
+        self._received_ticket("TK", 0)
+        self.app.respond_with_knowledge("TK", "K", 30)
+        self.app.receive("TK", "q", 30)
+        groups = self._customer_target_groups(
+            self.app.customer_response_target_report(40))
+        self.assertEqual((groups["normal"]["total"], groups["normal"]["answered"],
+                          groups["normal"]["on_time"]), (1, 1, 1))
+
+    def test_customer_response_target_report_reopen_classifies_by_current_state(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q", 5)
+        self.app.assign("T", "Eve")
+        self.app.close("T", "Done")
+        low_priority = lambda r: self._customer_target_groups(r)["normal"]
+        self.assertEqual(low_priority(self.app.customer_response_target_report(60))
+                         ["closed_without_answer"], 1)
+        self.app.reopen_ticket("T", "back")
+        reopened = low_priority(self.app.customer_response_target_report(60))
+        # 55 service-free minutes against the 30-minute normal target is overdue
+        self.assertEqual((reopened["pending"], reopened["overdue"],
+                          reopened["closed_without_answer"]), (1, 1, 0))
+        self.app.respond("T", "answer", 60)
+        answered = low_priority(self.app.customer_response_target_report(60))
+        self.assertEqual((answered["answered"], answered["pending"]), (1, 0))
+
+    def test_customer_response_target_report_window_matching_and_future_checks(self):
+        self._received_ticket("T", 0)
+        self.app.receive("T", "q10", 10)
+        self.app.receive("T", "q20", 20)
+        self.app.receive("T", "q40", 40)
+        self.app.respond("T", "a", 25)   # outside the [10,20) window but covers q10
+        report = self.app.customer_response_target_report(30, since=10, until=20)
+        normal = self._customer_target_groups(report)["normal"]
+        self.assertEqual((normal["total"], normal["answered"], normal["on_time"],
+                          normal["pending"]), (1, 1, 1, 0))
+        # the future follow-up q40 invalidates a query that selects it
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.customer_response_target_report(30, since=0, until=50)
+        self.assertEqual(before, self.app.path.read_bytes())
+        # empty window: four zero groups, null rates, and future records are not checked
+        empty = self.app.customer_response_target_report(30, since=10, until=10)
+        for group in empty["groups"]:
+            self.assertEqual(group["total"], 0)
+            self.assertIsNone(group["on_time_rate"])
+        # a window selecting no follow-up opts the ticket out entirely
+        opted_out = self.app.customer_response_target_report(30, since=50, until=60)
+        self.assertTrue(all(group["total"] == 0 for group in opted_out["groups"]))
+        # a future answer is checked only while a follow-up is selected; with
+        # [10,20) F opts out and only T's q10 is counted, so no error is raised
+        self._received_ticket("F", 0)
+        self.app.receive("F", "q", 5)
+        self.app.respond("F", "a", 40)
+        with self.assertRaises(ValueError):
+            self.app.customer_response_target_report(30)
+        opted = self._customer_target_groups(
+            self.app.customer_response_target_report(30, since=10, until=20))["normal"]
+        self.assertEqual(opted["total"], 1)
+        self.assertEqual(opted["answered"], 1)
+
+    def test_customer_response_target_report_service_periods(self):
+        periods = [[10, 20], [30, 50]]
+        self._received_ticket("T-done", 0)
+        self.app.receive("T-done", "q", 15)
+        self.app.respond("T-done", "a", 40)   # 15 covered minutes
+        self._received_ticket("T-wait", 0)
+        self.app.receive("T-wait", "q", 15)
+        kwargs = dict(targets={"normal": 15}, service_periods=periods)
+        groups = self._customer_target_groups(
+            self.app.customer_response_target_report(40, **kwargs))["normal"]
+        self.assertEqual((groups["answered"], groups["on_time"], groups["late"],
+                          groups["pending"], groups["overdue"]), (1, 1, 0, 1, 0))
+        groups41 = self._customer_target_groups(
+            self.app.customer_response_target_report(41, **kwargs))["normal"]
+        self.assertEqual((groups41["pending"], groups41["overdue"]), (1, 1))
+        # empty periods: answered elapsed and pending wait are both zero
+        empty = self._customer_target_groups(
+            self.app.customer_response_target_report(41, service_periods=[]))["normal"]
+        self.assertEqual((empty["answered"], empty["on_time"], empty["late"],
+                          empty["pending"], empty["overdue"]), (1, 1, 0, 1, 0))
+        # null periods keep natural minutes; periods outside the spans contribute nothing
+        natural = self._customer_target_groups(
+            self.app.customer_response_target_report(40, targets={"normal": 25}))["normal"]
+        self.assertEqual((natural["on_time"], natural["late"]), (1, 0))
+        outside = self._customer_target_groups(
+            self.app.customer_response_target_report(
+                40, targets={"normal": 1}, service_periods=[[0, 10], [60, 80]]))["normal"]
+        self.assertEqual((outside["answered"], outside["on_time"], outside["late"],
+                          outside["pending"], outside["overdue"]), (1, 1, 0, 1, 0))
+
+    def test_customer_response_target_report_bad_arguments_empty_data_and_read_only(self):
+        self._customer_target_scenario()
+        before = self.app.path.read_bytes()
+        for as_of in (True, False, 1.5, "40", None, -1):
+            with self.assertRaises(ValueError, msg=as_of):
+                self.app.customer_response_target_report(as_of)
+        for bad in (True, False, 1.5, "10", -1):
+            with self.assertRaises(ValueError, msg=("since", bad)):
+                self.app.customer_response_target_report(10, since=bad)
+            with self.assertRaises(ValueError, msg=("until", bad)):
+                self.app.customer_response_target_report(10, until=bad)
+        with self.assertRaises(ValueError):
+            self.app.customer_response_target_report(10, since=20, until=10)
+        for targets in ([], "x", 5, True, {"critical": 10}, {"normal": 0},
+                        {"normal": True}, {"normal": 30.0}, {"normal": None}):
+            with self.assertRaises(ValueError, msg=targets):
+                self.app.customer_response_target_report(100, targets=targets)
+        for periods in ({}, "x", 5, False, [[0]], [[0, 10, 20]], [[True, 10]],
+                        [[0.0, 10]], [[None, 10]], [[-1, 10]], [[10, 10]], [[20, 10]]):
+            with self.assertRaises(ValueError, msg=periods):
+                self.app.customer_response_target_report(100, service_periods=periods)
+        with self.assertRaises(TypeError):
+            self.app.customer_response_target_report()
+        with self.assertRaises(TypeError):
+            self.app.customer_response_target_report(10, bogus=1)
+        self.assertEqual(before, self.app.path.read_bytes())
+        empty = {"as_of": 0, "groups": [
+            {"priority": p, "target_minutes": t, "total": 0, "answered": 0, "on_time": 0,
+             "late": 0, "pending": 0, "overdue": 0, "closed_without_answer": 0,
+             "on_time_rate": None}
+            for p, t in (("urgent", 5), ("high", 15), ("normal", 30), ("low", 60))]}
+        self.assertEqual(SupportDesk(self.root / "empty-store")
+                         .customer_response_target_report(0), empty)
+        missing = self.root / "missing"
+        self.assertEqual(SupportDesk(missing).customer_response_target_report(0), empty)
+        self.assertFalse(missing.exists())
+        with self.assertRaises(ValueError):
+            SupportDesk(missing).customer_response_target_report(0, service_periods=[[-1, 2]])
+        self.assertFalse(missing.exists())
+        # successful and failed queries never write
+        self.app.customer_response_target_report(60)
+        self.assertEqual(before, self.app.path.read_bytes())
+
+    def test_cli_customer_response_target_report(self):
+        self._received_ticket("T-1", 0)
+        self.app.receive("T-1", "q", 10)
+        self.app.respond("T-1", "answer", 25)
+        query = self.root / "report.json"
+        query.write_text(json.dumps({"as_of": 30, "targets": {"normal": 20},
+                                     "service_periods": [[0, 30]]}), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "customer-response-target-report", str(query)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        normal = next(g for g in value["groups"] if g["priority"] == "normal")
+        self.assertEqual((normal["total"], normal["answered"], normal["on_time"]), (1, 1, 1))
+        # an array runs independent queries and returns an array of reports
+        query.write_text(json.dumps([{"as_of": 30},
+                                     {"as_of": 30, "targets": {"normal": 10}}]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "customer-response-target-report", str(query)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reports = json.loads(result.stdout)
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(next(g for g in reports[0]["groups"] if g["priority"] == "normal")["on_time"], 1)
+        self.assertEqual(next(g for g in reports[1]["groups"] if g["priority"] == "normal")["late"], 1)
+        bad = self.root / "bad.json"
+        bad.write_text(json.dumps({"as_of": -1}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "customer-response-target-report", str(bad)],
+                                text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+
     def test_escalate_overdue_first_response_wait_and_strict_boundary(self):
         self._received_ticket("T-9", 9)    # 40 - 9 = 31 > 30
         self._received_ticket("T-10", 10)  # 30 == 30
