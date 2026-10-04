@@ -5072,5 +5072,184 @@ class ProductTests(unittest.TestCase):
         # the first row committed before the second row failed
         self.assertEqual(SupportDesk(self.root).get("T-3")["category"], "hardware")
 
+    def _respond_many_setup(self):
+        self._closed_ticket("T-src", subject="Download", resolution="Sent link")
+        entry = self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket(" T-manual ", "Alice", "Need help", opened_at=5)
+        self.app.open_ticket("T-knowledge", "Bob", "Need download", opened_at=5)
+        self.app.open_ticket("T-third", "Cara", "Other", opened_at=8)
+        return entry
+
+    def test_respond_many_persists_mixed_batch_in_input_order(self):
+        entry = self._respond_many_setup()
+        items = [
+            {"ticket_id": " T-knowledge ", "article_id": "KB-1", "responded_at": 6},
+            {"ticket_id": " T-manual ", "message": "  On it\nsoon ", "responded_at": 5},
+        ]
+        tickets = self.app.respond_many(items)
+        self.assertEqual([t["ticket_id"] for t in tickets], ["T-knowledge", "T-manual"])
+        self.assertEqual(tickets[0]["first_response"],
+                         {"message": "Sent link", "responded_at": 6, "knowledge": dict(entry)})
+        self.assertEqual(tickets[1]["first_response"],
+                         {"message": "On it\nsoon", "responded_at": 5})
+        reloaded = SupportDesk(self.root)
+        self.assertEqual(reloaded.get("T-knowledge")["first_response"],
+                         {"message": "Sent link", "responded_at": 6, "knowledge": dict(entry)})
+        self.assertEqual(reloaded.get("T-manual")["first_response"],
+                         {"message": "On it\nsoon", "responded_at": 5})
+        self.assertIsNone(reloaded.get("T-third")["first_response"])
+
+    def test_respond_many_shares_one_article_and_writes_revision_only_when_asked(self):
+        entry = self._respond_many_setup()
+        self.app.update_knowledge("KB-1", "Download", "New link")
+        tickets = self.app.respond_many([
+            {"ticket_id": "T-knowledge", "article_id": "KB-1", "responded_at": 9},
+            {"ticket_id": "T-third", "article_id": "KB-1", "responded_at": 9, "revision": 1},
+        ])
+        current = tickets[0]["first_response"]
+        self.assertEqual(current["message"], "New link")
+        self.assertEqual(current["knowledge"], dict(entry) | {"content": "New link"})
+        self.assertNotIn("knowledge_revision", current)
+        first = tickets[1]["first_response"]
+        self.assertEqual(first["message"], "Sent link")
+        self.assertEqual(first["knowledge"], dict(entry))
+        self.assertEqual(first["knowledge_revision"], 1)
+
+    def test_respond_many_counts_in_stats_usage_and_queues(self):
+        self._respond_many_setup()
+        self.app.respond_many([
+            {"ticket_id": "T-manual", "message": "On it", "responded_at": 6},
+            {"ticket_id": "T-knowledge", "article_id": "KB-1", "responded_at": 7},
+        ])
+        stats = self.app.response_stats()
+        self.assertEqual((stats["timed"], stats["responded"], stats["pending"]), (3, 2, 1))
+        queue = self.app.response_queue(20)
+        self.assertEqual([i["ticket"]["ticket_id"] for i in queue["items"]], ["T-third"])
+        usage = self.app.knowledge_usage_report()
+        kb = next(row for row in usage if row["article"]["article_id"] == "KB-1")
+        self.assertEqual((kb["first_responses"], kb["replies"], kb["ticket_count"]), (1, 0, 1))
+
+    def test_respond_many_atomic_on_disabled_article_leaves_all_unanswered(self):
+        self._respond_many_setup()
+        self.app.set_knowledge_enabled("KB-1", False)
+        before = self.app.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.app.respond_many([
+                {"ticket_id": "T-manual", "message": "On it", "responded_at": 6},
+                {"ticket_id": "T-knowledge", "article_id": "KB-1", "responded_at": 6},
+            ])
+        self.assertEqual(before, self.app.path.read_bytes())
+        for ticket_id in ("T-manual", "T-knowledge", "T-third"):
+            self.assertIsNone(self.app.get(ticket_id)["first_response"])
+
+    def test_respond_many_rejects_bad_items_without_writing(self):
+        self._respond_many_setup()
+        self.app.open_ticket("T-untimed", "Dan", "No clock")
+        self._closed_ticket("T-closed-2", subject="X", resolution="Done")
+        self.app.respond("T-third", "Already", 9)
+        before = self.app.path.read_bytes()
+        bad_items = [
+            None, [], {}, "x",
+            [{"ticket_id": "T-manual", "responded_at": 6}],
+            [{"message": "On it", "responded_at": 6}],
+            [{"ticket_id": "T-manual", "message": "On it", "article_id": "KB-1", "responded_at": 6}],
+            [{"ticket_id": "T-manual", "message": "On it", "responded_at": 6, "extra": 1}],
+            [{"ticket_id": "T-manual", "message": "On it", "responded_at": 6, "revision": 1}],
+            [{"ticket_id": "T-manual", "article_id": "KB-1", "responded_at": 6, "revision": None, "extra": 1}],
+            [{"ticket_id": None, "message": "On it", "responded_at": 6}],
+            [{"ticket_id": " ", "message": "On it", "responded_at": 6}],
+            [{"ticket_id": 1, "message": "On it", "responded_at": 6}],
+            [{"ticket_id": "T-manual", "message": None, "responded_at": 6}],
+            [{"ticket_id": "T-manual", "message": " ", "responded_at": 6}],
+            [{"ticket_id": "T-manual", "article_id": 1, "responded_at": 6}],
+            [{"ticket_id": "T-manual", "article_id": " ", "responded_at": 6}],
+            [{"ticket_id": "T-manual", "message": "On it", "responded_at": True}],
+            [{"ticket_id": "T-manual", "message": "On it", "responded_at": 1.5}],
+            [{"ticket_id": "T-manual", "message": "On it", "responded_at": "6"}],
+            [{"ticket_id": "T-manual", "message": "On it", "responded_at": None}],
+            [{"ticket_id": "T-manual", "message": "On it", "responded_at": -1}],
+            [{"ticket_id": "T-manual", "message": "On it", "responded_at": 4}],
+            [{"ticket_id": " t-manual ", "message": "On it", "responded_at": 6}],
+            [{"ticket_id": "missing", "message": "On it", "responded_at": 6}],
+            [{"ticket_id": "T-closed-2", "message": "On it", "responded_at": 6}],
+            [{"ticket_id": "T-untimed", "message": "On it", "responded_at": 6}],
+            [{"ticket_id": "T-third", "message": "Again", "responded_at": 10}],
+            [{"ticket_id": "T-knowledge", "article_id": "kb-1", "responded_at": 6}],
+            [{"ticket_id": "T-knowledge", "article_id": "KB-X", "responded_at": 6}],
+            [{"ticket_id": "T-knowledge", "article_id": "KB-1", "responded_at": 6, "revision": True}],
+            [{"ticket_id": "T-knowledge", "article_id": "KB-1", "responded_at": 6, "revision": 0}],
+            [{"ticket_id": "T-knowledge", "article_id": "KB-1", "responded_at": 6, "revision": 9}],
+            [
+                {"ticket_id": "T-manual", "message": "On it", "responded_at": 6},
+                {"ticket_id": " T-manual ", "message": "Again", "responded_at": 7},
+            ],
+        ]
+        for items in bad_items:
+            with self.assertRaises(ValueError, msg=items):
+                self.app.respond_many(items)
+        self.assertEqual(before, self.app.path.read_bytes())
+        self.assertIsNone(self.app.get("T-manual")["first_response"])
+        self.assertIsNone(self.app.get("T-knowledge")["first_response"])
+        self.assertEqual(self.app.get("T-third")["first_response"]["message"], "Already")
+
+    def test_respond_many_type_errors_and_empty_first_response_count_as_pending(self):
+        self._respond_many_setup()
+        with self.assertRaises(TypeError):
+            self.app.respond_many()
+        with self.assertRaises(TypeError):
+            self.app.respond_many([], [])
+        with self.assertRaises(TypeError):
+            self.app.respond_many(items=[{"ticket_id": "T-manual", "message": "On it",
+                                          "responded_at": 6}], extra=1)
+        # an existing empty-object first response still means "not responded"
+        data = self.app._read()
+        data["tickets"]["T-manual"]["first_response"] = {}
+        self.app._write(data)
+        ticket = self.app.respond_many([{"ticket_id": "T-manual", "message": "On it",
+                                         "responded_at": 6}])[0]
+        self.assertEqual(ticket["first_response"], {"message": "On it", "responded_at": 6})
+
+    def test_respond_many_failure_creates_no_directory_or_file(self):
+        fresh = self.root / "missing"
+        app = SupportDesk(fresh)
+        with self.assertRaises(ValueError):
+            app.respond_many([{"ticket_id": "T", "message": "hi", "responded_at": 1}])
+        self.assertFalse(fresh.exists())
+
+    def test_cli_respond_many(self):
+        self._respond_many_setup()
+        self.app.set_knowledge_enabled("KB-1", False)
+        payload = self.root / "many.json"
+        payload.write_text(json.dumps({"items": [
+            {"ticket_id": "T-manual", "message": "On it", "responded_at": 6},
+            {"ticket_id": "T-knowledge", "article_id": "KB-1", "responded_at": 6},
+        ]}), encoding="utf-8")
+        failed = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "respond-many", str(payload)], text=True, capture_output=True)
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("error", json.loads(failed.stderr))
+        self.assertIsNone(SupportDesk(self.root).get("T-manual")["first_response"])
+        self.app.set_knowledge_enabled("KB-1", True)
+        ok = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                             "respond-many", str(payload)], text=True, capture_output=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        value = json.loads(ok.stdout)
+        self.assertEqual([t["ticket_id"] for t in value], ["T-manual", "T-knowledge"])
+        self.assertEqual(value[1]["first_response"]["knowledge"]["article_id"], "KB-1")
+        # an outer array is still independent batches; the second failed batch
+        # never rolls back the first one
+        batch = self.root / "batch.json"
+        batch.write_text(json.dumps([
+            {"items": [{"ticket_id": "T-third", "article_id": "KB-1", "responded_at": 9}]},
+            {"items": [{"ticket_id": "T-manual", "message": "late", "responded_at": 7}]},
+        ]), encoding="utf-8")
+        second = subprocess.run([sys.executable, "-m", "support_desk", "--root", str(self.root),
+                                 "respond-many", str(batch)], text=True, capture_output=True)
+        self.assertEqual(second.returncode, 2)
+        self.assertIn("error", json.loads(second.stderr))
+        self.assertEqual(SupportDesk(self.root).get("T-third")["first_response"]["message"],
+                         "Sent link")
+
 if __name__ == "__main__":
     unittest.main()
