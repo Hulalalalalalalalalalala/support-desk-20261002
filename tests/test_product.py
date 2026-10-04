@@ -2728,6 +2728,179 @@ class ProductTests(unittest.TestCase):
             self.assertEqual(SupportDesk(self.root).search_tickets("sharedword", **kwargs),
                              self.app.search_tickets("sharedword", **kwargs))
 
+    def _boolean_scenario(self):
+        self.app.open_ticket("T-refund", "Alice", "申请退款")
+        self.app.open_ticket("T-return", "Bob", "退货咨询")
+        self.app.open_ticket("T-both", "Carol", "退款与退货")
+        self.app.note("T-both", "客户反馈重复 扣款")
+        self.app.open_ticket("T-double", "Dan", "账单问题")
+        self.app.open_ticket("T-plain", "Eve", "其他问题")
+
+    def _boolean_ids(self, query, **kwargs):
+        kwargs["query_mode"] = "boolean"
+        return self._search_ids(query, **kwargs)
+
+    def test_search_tickets_boolean_and_or_not_and_parentheses(self):
+        self._boolean_scenario()
+        ids = self._boolean_ids
+        self.assertEqual(ids("退款 OR 退货"), ["T-both", "T-refund", "T-return"])
+        self.assertEqual(ids("退款 AND 退货"), ["T-both"])
+        self.assertEqual(ids("NOT 退款"), ["T-double", "T-plain", "T-return"])
+        self.assertEqual(ids("NOT NOT 退款"), ["T-both", "T-refund"])
+        # the documented example: refund or return, but no record carries the phrase
+        self.assertEqual(ids('(退款 OR 退货) AND NOT "重复 扣款"'), ["T-refund", "T-return"])
+        # NOT binds tighter than AND, AND tighter than OR
+        self.assertEqual(ids("退款 OR 退货 AND NOT 咨询"), ["T-both", "T-refund"])
+        self.assertEqual(ids("(退款 OR 退货) AND (NOT 咨询)"), ["T-both", "T-refund"])
+        # nested parentheses and consecutive NOT
+        self.assertEqual(ids("NOT (退款 OR 退货)"), ["T-double", "T-plain"])
+        self.assertEqual(ids("NOT NOT NOT 退款"), ["T-double", "T-plain", "T-return"])
+        self.assertEqual(ids("((退款))"), ["T-both", "T-refund"])
+        # a pure negation query is legal and hits are counted once per ticket
+        self.assertEqual(ids('NOT "重复 扣款"'),
+                         ["T-double", "T-plain", "T-refund", "T-return"])
+        # conditions may hit different records of one ticket
+        self.assertEqual(ids("退款 AND 扣款"), ["T-both"])
+
+    def test_search_tickets_boolean_phrases_casefold_escapes_and_literal_words(self):
+        self.app.open_ticket("T-1", "Alice", "Reset PASSWORD Straße")
+        self.app.open_ticket("T-2", "Bob", 'He said "hi,  there" twice')
+        self.app.open_ticket("T-3", "Carol", "path C:\\new here")
+        self.app.open_ticket("T-4", "Dan", "and or not")
+        ids = self._boolean_ids
+        # phrase whitespace is kept verbatim and casefold applies
+        self.assertEqual(ids('"reset password"'), ["T-1"])
+        self.assertEqual(ids('"RESET  PASSWORD"'), [])
+        self.assertEqual(ids('"hi,  there"'), ["T-2"])
+        self.assertEqual(ids('"hi, there"'), [])
+        # backslash escapes only a quote or a backslash inside a phrase
+        self.assertEqual(ids('"said \\"hi"'), ["T-2"])
+        self.assertEqual(ids('"C:\\\\new"'), ["T-3"])
+        # a backslash inside a plain word is literal
+        self.assertEqual(ids("C:\\new"), ["T-3"])
+        self.assertEqual(ids("C:\\\\new"), [])
+        # lowercase operator spellings are plain words, punctuation stays literal
+        self.assertEqual(ids("and"), ["T-4"])
+        self.assertEqual(ids("and AND or"), ["T-4"])
+        self.assertEqual(ids("not"), ["T-4"])
+        self.assertEqual(ids("NOT not"), ["T-1", "T-2", "T-3"])
+        # operator words must be exact uppercase tokens
+        self.assertEqual(ids("ANDY"), [])
+        # phrases and words may mix; casefold works for words too
+        self.assertEqual(ids('STRASSE AND "reset password"'), ["T-1"])
+
+    def test_search_tickets_boolean_keeps_filters_sort_and_pagination(self):
+        self._boolean_scenario()
+        self.app.set_category("T-refund", "billing")
+        self.app.set_category("T-return", "billing")
+        self.app.assign("T-return", "Eve")
+        self.app.close("T-return", "已退货")
+        self.assertEqual(self._boolean_ids("退款 OR 退货", status="open"),
+                         ["T-both", "T-refund"])
+        self.assertEqual(self._boolean_ids("退款 OR 退货", status="closed"), ["T-return"])
+        self.assertEqual(self._boolean_ids("退款 OR 退货", category="billing"),
+                         ["T-refund", "T-return"])
+        self.assertEqual(self._boolean_ids("退款 OR 退货", category=None), ["T-both"])
+        result = self.app.search_tickets("退款 OR 退货", query_mode="boolean",
+                                         offset=1, limit=1)
+        self.assertEqual(result["total"], 3)
+        self.assertEqual([t["ticket_id"] for t in result["items"]], ["T-refund"])
+        # explicit plain mode keeps the existing split-term semantics
+        self.assertEqual(self._search_ids("退款 退货", query_mode="plain"), ["T-both"])
+        self.assertEqual(self._search_ids("退款 OR 退货", query_mode="plain"), [])
+        self.assertEqual(self._search_ids("退款 OR 退货"), [])
+
+    def test_search_tickets_boolean_searches_same_fields_and_knowledge_body(self):
+        self._closed_ticket("T-src", subject="Source", resolution="Knowkw body")
+        self.app.publish_knowledge("KB-1", "T-src")
+        self.app.open_ticket("T-kr", "Alice", "Need help", opened_at=5)
+        self.app.respond_with_knowledge("T-kr", "KB-1", 6)
+        self.app.open_ticket("T-note", "Bob", "Nothing")
+        self.app.note("T-note", "Notekw here")
+        ids = self._boolean_ids
+        # the saved knowledge body is searchable, snapshot metadata is not
+        self.assertEqual(ids("knowkw"), ["T-kr", "T-src"])
+        self.assertEqual(ids("kb-1 OR source"), ["T-src"])
+        # notes, resolution and reply bodies participate in boolean queries
+        self.assertEqual(ids("notekw AND NOT knowkw"), ["T-note"])
+        self.app.reply("T-kr", "Replykw follow", 7)
+        self.assertEqual(ids("replykw OR notekw"), ["T-kr", "T-note"])
+        # NOT negates over the whole ticket: T-kr carries knowkw in two records
+        self.assertEqual(ids("NOT knowkw"), ["T-note"])
+
+    def test_search_tickets_boolean_rejects_bad_syntax_and_mode_without_writing(self):
+        self._boolean_scenario()
+        before = self.app.path.read_bytes()
+        for mode in ("PLAIN", "Boolean", "", " ", None, 1, True, [], {}):
+            with self.assertRaises(ValueError, msg=mode):
+                self.app.search_tickets("退款", query_mode=mode)
+        for query in (
+            '""', '"   "', '"unterminated', '"dangling\\', '"bad \\escape"',
+            "(", ")", "(退款", "退款)", "()", "( )",
+            "AND 退款", "退款 AND", "退款 OR", "OR", "NOT", "退款 NOT",
+            "AND", "退款 AND OR 退货", "退款 AND AND 退货",
+            "退款 退货", "退款 (退货)", "(退款) (退货)", '退款 "退 货"',
+            "NOT AND 退款", "退款 OR NOT",
+        ):
+            with self.assertRaises(ValueError, msg=query):
+                self.app.search_tickets(query, query_mode="boolean")
+        # the original argument validation still applies in boolean mode
+        for query in (None, 1, True, [], " "):
+            with self.assertRaises(ValueError, msg=query):
+                self.app.search_tickets(query, query_mode="boolean")
+        with self.assertRaises(ValueError):
+            self.app.search_tickets("退款", query_mode="boolean", status="nope")
+        with self.assertRaises(ValueError):
+            self.app.search_tickets("退款", query_mode="boolean", offset=-1)
+        with self.assertRaises(ValueError):
+            self.app.search_tickets("退款", query_mode="boolean", limit=0)
+        with self.assertRaises(TypeError):
+            self.app.search_tickets("退款", "open", None, 0, 20, "boolean")
+        self.assertEqual(self.app.path.read_bytes(), before)
+
+    def test_search_tickets_boolean_validates_syntax_on_empty_data_and_stays_read_only(self):
+        missing = self.root / "missing"
+        fresh = SupportDesk(missing)
+        self.assertEqual(fresh.search_tickets("anything OR else", query_mode="boolean"),
+                         {"total": 0, "items": []})
+        self.assertEqual(fresh.search_tickets("NOT anything", query_mode="boolean"),
+                         {"total": 0, "items": []})
+        with self.assertRaises(ValueError):
+            fresh.search_tickets("(", query_mode="boolean")
+        with self.assertRaises(ValueError):
+            fresh.search_tickets("anything", query_mode="nope")
+        self.assertFalse(missing.exists())
+        # same data and arguments give the same result after recreating the desk
+        self._boolean_scenario()
+        self.assertEqual(
+            SupportDesk(self.root).search_tickets('(退款 OR 退货) AND NOT "重复 扣款"',
+                                                  query_mode="boolean"),
+            self.app.search_tickets('(退款 OR 退货) AND NOT "重复 扣款"',
+                                    query_mode="boolean"))
+
+    def test_cli_ticket_search_boolean_mode(self):
+        self._boolean_scenario()
+        result = self._cli_search({"query": '(退款 OR 退货) AND NOT "重复 扣款"',
+                                   "query_mode": "boolean"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         self.app.search_tickets('(退款 OR 退货) AND NOT "重复 扣款"',
+                                                 query_mode="boolean"))
+        result = self._cli_search({"query": "退款", "query_mode": "boolean"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([t["ticket_id"] for t in json.loads(result.stdout)["items"]],
+                         ["T-both", "T-refund"])
+        for body in (
+            {"query": "(退款", "query_mode": "boolean"},
+            {"query": "退款 退货", "query_mode": "boolean"},
+            {"query": '""', "query_mode": "boolean"},
+            {"query": "退款", "query_mode": "nope"},
+        ):
+            result = self._cli_search(body)
+            self.assertEqual(result.returncode, 2, body)
+            self.assertEqual(result.stdout, "", body)
+            self.assertIn("error", json.loads(result.stderr), body)
+
     def _cli_search(self, body):
         payload = self.root / "search-input.json"
         payload.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")

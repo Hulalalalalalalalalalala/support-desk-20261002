@@ -203,6 +203,123 @@ def _due_minute(periods, opened_at, target):
     return None
 
 
+def _boolean_tokens(query):
+    # Split a boolean query into parentheses, quoted phrases and plain words.
+    # Words end at whitespace, parentheses and double quotes; every other
+    # character, including backslashes and lowercase operator spellings, is a
+    # literal part of the word.
+    tokens = []
+    index = 0
+    while index < len(query):
+        char = query[index]
+        if char.isspace():
+            index += 1
+            continue
+        if char in "()":
+            tokens.append((char, None))
+            index += 1
+            continue
+        if char == '"':
+            index += 1
+            chars = []
+            while index < len(query) and query[index] != '"':
+                if query[index] == "\\":
+                    # Inside a phrase a backslash escapes only a quote or
+                    # another backslash; anything else is a syntax error.
+                    if index + 1 >= len(query) or query[index + 1] not in '"\\':
+                        raise ValueError("a phrase backslash may only escape a quote or a backslash")
+                    chars.append(query[index + 1])
+                    index += 2
+                else:
+                    chars.append(query[index])
+                    index += 1
+            if index >= len(query):
+                raise ValueError("phrase quote is not closed")
+            index += 1
+            phrase = "".join(chars)
+            if not phrase.strip():
+                raise ValueError("phrase must not be empty or all whitespace")
+            tokens.append(("phrase", phrase))
+            continue
+        start = index
+        while index < len(query) and not query[index].isspace() and query[index] not in '()"':
+            index += 1
+        tokens.append(("word", query[start:index]))
+    return tokens
+
+
+def _parse_boolean(query):
+    # Grammar: OR binds loosest, then AND, then NOT; parentheses nest freely
+    # and consecutive NOT is allowed. Adjacent conditions without an explicit
+    # AND/OR, missing operands and unpaired brackets are syntax errors.
+    tokens = _boolean_tokens(query)
+    position = 0
+
+    def peek():
+        return tokens[position] if position < len(tokens) else None
+
+    def take():
+        nonlocal position
+        token = tokens[position]
+        position += 1
+        return token
+
+    def parse_or():
+        node = parse_and()
+        while peek() == ("word", "OR"):
+            take()
+            node = ("or", node, parse_and())
+        return node
+
+    def parse_and():
+        node = parse_not()
+        while peek() == ("word", "AND"):
+            take()
+            node = ("and", node, parse_not())
+        return node
+
+    def parse_not():
+        if peek() == ("word", "NOT"):
+            take()
+            return ("not", parse_not())
+        return parse_primary()
+
+    def parse_primary():
+        token = peek()
+        if token == ("(", None):
+            take()
+            node = parse_or()
+            if peek() != (")", None):
+                raise ValueError("parenthesis is not closed")
+            take()
+            return node
+        if token is not None and token[0] in ("word", "phrase") and \
+                token not in (("word", "AND"), ("word", "OR"), ("word", "NOT")):
+            take()
+            return ("term", token[1].casefold())
+        raise ValueError("missing operand")
+
+    expression = parse_or()
+    if position != len(tokens):
+        raise ValueError("conditions must be joined explicitly by AND or OR")
+    return expression
+
+
+def _boolean_matches(expression, haystacks):
+    # A term hits when its casefolded text is a contiguous substring of one
+    # haystack; NOT negates over the ticket's whole searchable content.
+    kind = expression[0]
+    if kind == "term":
+        return any(expression[1] in haystack for haystack in haystacks)
+    if kind == "not":
+        return not _boolean_matches(expression[1], haystacks)
+    if kind == "and":
+        return _boolean_matches(expression[1], haystacks) and \
+            _boolean_matches(expression[2], haystacks)
+    return _boolean_matches(expression[1], haystacks) or \
+        _boolean_matches(expression[2], haystacks)
+
+
 class SupportDesk(JsonStore):
     def open_ticket(self, ticket_id, customer, subject, opened_at=None):
         ticket_id, customer, subject = text(ticket_id, "ticket_id"), text(customer, "customer"), text(subject, "subject")
@@ -2005,9 +2122,11 @@ class SupportDesk(JsonStore):
             matches = (t for t in tickets if t.get("category") == category)
         return sorted((t for t in matches if status is None or t["status"] == status), key=lambda t: t["ticket_id"])
 
-    def search_tickets(self, query, status=None, category=_UNSET, offset=0, limit=20):
+    def search_tickets(self, query, status=None, category=_UNSET, offset=0, limit=20, *, query_mode="plain"):
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a nonempty string")
+        if query_mode not in ("plain", "boolean"):
+            raise ValueError("query_mode must be plain or boolean")
         if status not in (None, "open", "closed"):
             raise ValueError("status must be open or closed")
         if category is not _UNSET and category is not None:
@@ -2017,7 +2136,16 @@ class SupportDesk(JsonStore):
             raise ValueError("offset must be a nonnegative integer")
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
-        terms = [term.casefold() for term in query.strip().split()]
+        if query_mode == "plain":
+            terms = [term.casefold() for term in query.strip().split()]
+
+            def matches(haystacks):
+                return all(any(term in haystack for haystack in haystacks) for term in terms)
+        else:
+            expression = _parse_boolean(query)
+
+            def matches(haystacks):
+                return _boolean_matches(expression, haystacks)
         matched = []
         for ticket in self._read().get("tickets", {}).values():
             if status is not None and ticket["status"] != status:
@@ -2041,7 +2169,7 @@ class SupportDesk(JsonStore):
                 if reply.get("message"):
                     fields.append(reply["message"])
             haystacks = [field.casefold() for field in fields]
-            if all(any(term in haystack for haystack in haystacks) for term in terms):
+            if matches(haystacks):
                 matched.append(ticket)
         matched.sort(key=lambda ticket: ticket["ticket_id"])
         return {"total": len(matched), "items": matched[offset:offset + limit]}
